@@ -4,8 +4,6 @@
 //! `/proc/self/statm`, `/proc/self/stat`, and `/proc/self/io`. On other
 //! platforms, returns zeros.
 
-use std::sync::Mutex;
-
 /// Snapshot of host daemon metrics.
 #[derive(Debug, Clone, Default)]
 pub struct HostSnapshot {
@@ -17,20 +15,17 @@ pub struct HostSnapshot {
 
 /// Collects host-side daemon metrics. Maintains previous CPU tick values for
 /// delta-based CPU percentage calculation.
+#[derive(Default)]
 pub struct HostMetricsCollector {
-    prev_cpu_ticks: Mutex<(u64, u64)>, // (user+sys ticks, total ticks)
-}
-
-impl Default for HostMetricsCollector {
-    fn default() -> Self {
-        Self::new()
-    }
+    #[cfg(target_os = "linux")]
+    prev_cpu_ticks: std::sync::Mutex<(u64, u64)>,
 }
 
 impl HostMetricsCollector {
     pub fn new() -> Self {
         Self {
-            prev_cpu_ticks: Mutex::new((0, 0)),
+            #[cfg(target_os = "linux")]
+            prev_cpu_ticks: std::sync::Mutex::new((0, 0)),
         }
     }
 
