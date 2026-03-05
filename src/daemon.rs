@@ -40,6 +40,9 @@ struct CreateRunRequest {
     run_id: Option<String>,
     #[serde(default)]
     policy: Option<crate::persistence::RunPolicy>,
+    /// Snapshot path or hash-prefix to restore from (explicit opt-in).
+    #[serde(default)]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,7 +442,18 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
         });
 
         let path = PathBuf::from(&req.file);
-        let result = run_file(&path, req.input, policy_bg, Some(stage_tx)).await;
+        // If the request specifies a snapshot, override the spec before running.
+        let result = if req.snapshot.is_some() {
+            match crate::spec::load_spec(&path) {
+                Ok(mut spec) => {
+                    spec.sandbox.snapshot = req.snapshot;
+                    crate::runtime::run_spec(&spec, req.input, policy_bg, Some(stage_tx)).await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            run_file(&path, req.input, policy_bg, Some(stage_tx)).await
+        };
 
         // Wait for collector to drain remaining events
         let _ = collector_handle.await;

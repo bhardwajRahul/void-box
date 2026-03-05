@@ -79,6 +79,7 @@ impl LocalSandbox {
                 max_concurrent_connections: 64,
                 seccomp: true,
             },
+            snapshot: self.config.snapshot.clone(),
         };
 
         // Create platform-appropriate backend

@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "status" => cmd_status(&args[2..]).await?,
         "logs" => cmd_logs(&args[2..]).await?,
         "tui" => cmd_tui(&args[2..]).await?,
+        "snapshot" => cmd_snapshot(&args[2..]).await?,
         "exec" => cmd_legacy_exec(&args[2..]).await?,
         "workflow" => cmd_legacy_workflow(&args[2..]).await?,
         "version" | "--version" | "-V" => println!("voidbox {}", env!("CARGO_PKG_VERSION")),
@@ -334,6 +335,175 @@ async fn get_remote_messages(
     Ok(body)
 }
 
+#[cfg(target_os = "linux")]
+async fn cmd_snapshot(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("usage: voidbox snapshot <create|list|delete> [options]");
+        std::process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "create" => cmd_snapshot_create(&args[1..]).await,
+        "list" => cmd_snapshot_list(),
+        "delete" => cmd_snapshot_delete(&args[1..]),
+        _ => {
+            eprintln!("unknown snapshot subcommand: {}", args[0]);
+            eprintln!("usage: voidbox snapshot <create|list|delete>");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn cmd_snapshot(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("snapshot commands are only supported on Linux (KVM)");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
+async fn cmd_snapshot_create(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use void_box::vmm::config::VoidBoxConfig;
+    use void_box::vmm::snapshot;
+    use void_box::MicroVm;
+
+    let kernel = arg_value(args, "--kernel")
+        .map(PathBuf::from)
+        .ok_or("snapshot create requires --kernel <path>")?;
+    let initramfs = arg_value(args, "--initramfs").map(PathBuf::from);
+    let memory_mb: usize = arg_value(args, "--memory")
+        .unwrap_or_else(|| "128".to_string())
+        .parse()?;
+    let vcpus: usize = arg_value(args, "--vcpus")
+        .unwrap_or_else(|| "1".to_string())
+        .parse()?;
+
+    eprintln!(
+        "Creating snapshot: kernel={}, initramfs={:?}, memory={}MB, vcpus={}",
+        kernel.display(),
+        initramfs.as_ref().map(|p| p.display()),
+        memory_mb,
+        vcpus
+    );
+
+    // Compute config hash
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), memory_mb, vcpus)?;
+    let snapshot_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+    eprintln!("Config hash: {}", &config_hash[..16]);
+
+    // Check for existing snapshot
+    if snapshot_dir.join("state.bin").exists() {
+        eprintln!("Snapshot already exists at {}", snapshot_dir.display());
+        eprintln!(
+            "Delete it first with: voidbox snapshot delete {}",
+            &config_hash[..16]
+        );
+        std::process::exit(1);
+    }
+
+    // Build VM config
+    let mut config = VoidBoxConfig::new()
+        .kernel(&kernel)
+        .memory_mb(memory_mb)
+        .vcpus(vcpus);
+    if let Some(ref initramfs) = initramfs {
+        config = config.initramfs(initramfs);
+    }
+
+    // Boot VM
+    let start = std::time::Instant::now();
+    eprintln!("Booting VM...");
+    let vm = MicroVm::new(config.clone()).await?;
+    let boot_ms = start.elapsed().as_millis();
+    eprintln!("VM booted in {}ms, waiting for guest-agent...", boot_ms);
+
+    // Wait a moment for guest-agent to initialize
+    // (The first vsock exec will do the ping/pong handshake)
+    let output = vm.exec("echo", &["snapshot-ready"]).await?;
+    if !output.success() {
+        return Err(format!("Guest-agent not ready: {}", output.stderr_str()).into());
+    }
+    eprintln!(
+        "Guest-agent ready ({}ms total)",
+        start.elapsed().as_millis()
+    );
+
+    // Create snapshot
+    let snap_config = snapshot::SnapshotConfig {
+        memory_mb,
+        vcpus,
+        cid: vm.cid(),
+        vsock_mmio_base: 0xd080_0000,
+        network: config.network,
+    };
+
+    let snap_dir = vm
+        .snapshot(&snapshot_dir, config_hash.clone(), snap_config)
+        .await?;
+    let total_ms = start.elapsed().as_millis();
+
+    eprintln!("Snapshot created successfully:");
+    eprintln!("  Hash:     {}", &config_hash[..16]);
+    eprintln!("  Path:     {}", snap_dir.display());
+    eprintln!("  Duration: {}ms", total_ms);
+
+    let mem_size = fs::metadata(snapshot::VmSnapshot::memory_path(&snap_dir))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!("  Memory:   {} MB", mem_size / (1024 * 1024));
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_snapshot_list() -> Result<(), Box<dyn std::error::Error>> {
+    use void_box::vmm::snapshot;
+
+    let snapshots = snapshot::list_snapshots()?;
+    if snapshots.is_empty() {
+        println!("No snapshots found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<18} {:<8} {:<8} {:<10} PATH",
+        "HASH", "MEM(MB)", "VCPUS", "TYPE"
+    );
+    for info in &snapshots {
+        let type_str = match info.snapshot_type {
+            snapshot::SnapshotType::Base => "base",
+            snapshot::SnapshotType::Diff => "diff",
+            snapshot::SnapshotType::PostInit => "postinit",
+        };
+        println!(
+            "{:<18} {:<8} {:<8} {:<10} {}",
+            &info.config_hash[..16.min(info.config_hash.len())],
+            info.memory_mb,
+            info.vcpus,
+            type_str,
+            info.dir.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_snapshot_delete(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use void_box::vmm::snapshot;
+
+    let hash_prefix = args
+        .first()
+        .ok_or("snapshot delete requires <hash-prefix>")?;
+
+    if snapshot::delete_snapshot(hash_prefix)? {
+        println!("Deleted snapshot matching '{}'", hash_prefix);
+    } else {
+        eprintln!("No snapshot found matching '{}'", hash_prefix);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn cmd_legacy_exec(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
         eprintln!("usage: voidbox exec <cmd> [args...]");
@@ -407,6 +577,11 @@ USAGE:
   voidbox status --run-id <id> [--daemon http://127.0.0.1:43100]
   voidbox logs --run-id <id> [--daemon http://127.0.0.1:43100]
   voidbox tui [--file <spec.json|yaml>] [--daemon http://127.0.0.1:43100] [--session default]
+
+SNAPSHOT:
+  voidbox snapshot create --kernel <path> --initramfs <path> --memory <mb> [--vcpus <n>]
+  voidbox snapshot list
+  voidbox snapshot delete <hash-prefix>
 
 LEGACY:
   voidbox exec <cmd> [args...]

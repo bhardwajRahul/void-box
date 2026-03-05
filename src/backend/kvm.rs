@@ -66,6 +66,33 @@ impl KvmBackend {
 #[async_trait::async_trait]
 impl VmmBackend for KvmBackend {
     async fn start(&mut self, config: BackendConfig) -> Result<()> {
+        // Snapshot restore path: skip cold boot entirely
+        if let Some(ref snapshot_dir) = config.snapshot {
+            info!("Restoring VM from snapshot: {}", snapshot_dir.display());
+            let vm = MicroVm::from_snapshot(snapshot_dir).await?;
+            self.cid = vm.cid();
+
+            // The session secret comes from the snapshot (baked into kernel cmdline)
+            let snap = crate::vmm::snapshot::VmSnapshot::load(snapshot_dir)?;
+            let session_secret: [u8; 32] = snap
+                .session_secret
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+
+            let cid = self.cid;
+            let connector = Box::new(move || -> Result<Box<dyn GuestStream>> {
+                let stream = VsockStream::connect(cid, GUEST_AGENT_PORT)?;
+                Ok(Box::new(stream))
+            });
+            self.control_channel = Some(Arc::new(ControlChannel::new(connector, session_secret)));
+            self.vm = Some(vm);
+
+            debug!("KvmBackend restored from snapshot with CID {}", self.cid);
+            return Ok(());
+        }
+
+        // Normal cold-boot path
         let mut vm_config = VoidBoxConfig::new()
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)

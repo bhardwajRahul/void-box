@@ -68,9 +68,33 @@ impl VsockDevice {
         })
     }
 
+    /// Create a vsock device for a restored VM (skip boot wait).
+    pub fn restored(cid: u32, session_secret: [u8; 32]) -> Result<Self> {
+        if cid < 3 {
+            return Err(Error::Config(format!(
+                "Invalid CID {}: must be >= 3 (0-2 reserved)",
+                cid
+            )));
+        }
+        debug!(
+            "Creating restored vsock device with CID {} (boot wait skipped)",
+            cid
+        );
+        Ok(Self {
+            cid,
+            boot_wait_done: AtomicBool::new(true), // skip boot wait
+            session_secret,
+        })
+    }
+
     /// Get the CID for this device
     pub fn cid(&self) -> u32 {
         self.cid
+    }
+
+    /// Get the session secret (for snapshot capture).
+    pub fn session_secret(&self) -> &[u8; 32] {
+        &self.session_secret
     }
 
     /// Send an exec request to the guest agent and wait for response.

@@ -100,6 +100,7 @@ mod tests {
                 max_concurrent_connections: 64,
                 seccomp: false,
             },
+            snapshot: None,
         }
     }
 

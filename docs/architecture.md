@@ -163,11 +163,17 @@ Host and guest communicate over AF_VSOCK (port 1234) using the `void-box-protoco
 |---|---|---|---|
 | 0x01 | host → guest | ExecRequest | Execute a command (program, args, env, timeout) |
 | 0x02 | guest → host | ExecResponse | Command result (stdout, stderr, exit_code) |
-| 0x03 | guest → host | ExecOutputChunk | Streaming output chunk (stream, data, seq) |
-| 0x04 | host → guest | WriteFileRequest | Write file to guest filesystem |
-| 0x05 | guest → host | WriteFileResponse | Write file acknowledgement |
-| 0x06 | host → guest | MkdirPRequest | Create directory tree |
-| 0x07 | guest → host | MkdirPResponse | Mkdir acknowledgement |
+| 0x03 | both | Ping/Pong | Session authentication handshake |
+| 0x04 | guest → host | Pong | Authentication reply with protocol version |
+| 0x05 | host → guest | Shutdown | Request guest shutdown |
+| 0x0A | host → guest | SubscribeTelemetry | Start telemetry stream |
+| 0x0B | host → guest | WriteFile | Write file to guest filesystem |
+| 0x0C | guest → host | WriteFileResponse | Write file acknowledgement |
+| 0x0D | host → guest | MkdirP | Create directory tree |
+| 0x0E | guest → host | MkdirPResponse | Mkdir acknowledgement |
+| 0x0F | guest → host | ExecOutputChunk | Streaming output chunk (stream, data, seq) |
+| 0x10 | host → guest | ExecOutputAck | Flow control ack (optional) |
+| 0x11 | both | SnapshotReady | Guest signals readiness for live snapshot |
 
 ### Security
 
@@ -333,6 +339,115 @@ skills:
 | `cache.rs` | Content-addressed blob cache + rootfs/guest done markers |
 | `unpack.rs` | Layer extraction (full rootfs with whiteouts, or selective guest file extraction) |
 | `lib.rs` | `OciClient`: `pull()`, `resolve_rootfs()`, `resolve_guest_files()` |
+
+## Snapshots
+
+VoidBox supports three types of VM snapshots for sub-second restore. All snapshot features are **explicit opt-in only** — no snapshot code runs unless the user declares a snapshot path.
+
+### Snapshot types
+
+| Type | When created | Contents | Use case |
+|---|---|---|---|
+| **Base** | After cold boot, VM stopped | Full memory dump + all KVM state | Golden image for repeated boots |
+| **Diff** | After dirty tracking enabled, VM stopped | Only modified pages since base | Layered caching (base + delta) |
+| **PostInit** | After warmup commands, VM **keeps running** | Full memory + state (live capture) | Pre-warmed environments |
+
+### Storage layout
+
+```
+~/.void-box/snapshots/
+  └── <hash-prefix>/        # first 16 chars of config hash
+      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
+      ├── memory.mem         # full memory dump (base/postinit)
+      └── memory.diff        # dirty pages only (diff snapshots)
+```
+
+### Restore flow
+
+```
+1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, PIT, vsock state)
+2. Vm::new(memory_mb)              Create KVM VM with matching memory size
+3. restore_memory(mem, path)       COW mmap(MAP_PRIVATE|MAP_FIXED) — lazy page loading
+4. vm.restore_irqchip(state)       Restore PIC master/slave + IOAPIC
+5. vm.restore_pit(state)           Restore PIT timer
+6. VirtioVsockMmio::restore()      Restore vsock device registers
+7. create_vcpu_restored(state)     Set CPUID + restore full register state per vCPU
+8. vCPU threads resume             Guest continues execution from snapshot point
+```
+
+Memory restore uses kernel `MAP_PRIVATE` lazy page loading — pages are demand-faulted from the file, writes create anonymous copies. No userfaultfd required.
+
+### Live snapshot (PostInit)
+
+For PostInit snapshots, the VM stays running:
+
+```
+1. Host sets snapshot_requested flag
+2. Each vCPU, after its current KVM_RUN exit:
+   a. Captures its own register state
+   b. Waits on barrier (all vCPUs paused)
+3. Host thread waits on barrier (all vCPUs paused)
+4. Host captures: irqchip, PIT, vsock state, full memory dump
+5. Host clears flag, releases barrier
+6. vCPUs resume execution
+```
+
+### Opt-in plumbing
+
+Every layer has an optional snapshot field that defaults to `None`:
+
+| Layer | Field | Type | Default |
+|---|---|---|---|
+| `SandboxBuilder` | `.snapshot(path)` | `Option<PathBuf>` | `None` |
+| `BoxConfig` | `snapshot` | `Option<PathBuf>` | `None` |
+| `BoxConfig` | `warmup` | `Option<WarmupSpec>` | `None` |
+| `SandboxSpec` (YAML) | `sandbox.snapshot` | `Option<String>` | `None` |
+| `BoxSandboxOverride` | `sandbox.snapshot` | `Option<String>` | `None` |
+| `PipelineBoxSpec` | `warmup` | `Option<WarmupSpec>` | `None` |
+| `CreateRunRequest` (API) | `snapshot` | `Option<String>` | `None` |
+
+Resolution chain: per-box override → top-level spec → `None` (cold boot).
+
+### Snapshot resolution
+
+When a snapshot string is provided, the runtime resolves it as:
+
+1. **Hash prefix** → `~/.void-box/snapshots/<prefix>/` (if `state.bin` exists)
+2. **Literal path** → treat as directory path (if `state.bin` exists)
+3. **Neither** → warning printed, cold boot
+
+No env var fallback, no auto-detection.
+
+### Cache management
+
+- **LRU eviction**: `evict_lru(max_bytes)` removes oldest snapshots first
+- **Layer hashing**: `compute_layer_hash(base, layer, content)` for deterministic cache keys
+- **Listing**: `list_snapshots()` / `voidbox snapshot list`
+- **Deletion**: `delete_snapshot(prefix)` / `voidbox snapshot delete <prefix>`
+
+### Security considerations
+
+Snapshot cloning shares identical VM state across restored instances:
+
+- **RNG entropy**: Restored VMs inherit the same `/dev/urandom` pool. Mitigated by: fresh CID and session secret per restore, hardware `RDRAND` re-seeding on `rdtsc`
+- **ASLR**: Clones share guest page table layout. Mitigated by: short-lived tasks, no direct network addressability (SLIRP NAT), command allowlist limiting attack surface
+- **Session isolation**: Each restored VM gets a unique session secret injected via kernel cmdline — the snapshot's stored secret is not reused for authentication
+
+### Key source files
+
+| File | Contents |
+|---|---|
+| `src/vmm/snapshot.rs` | Snapshot types, memory dump/restore, diff support, cache management |
+| `src/vmm/mod.rs` | `MicroVm::snapshot()`, `from_snapshot()`, `snapshot_live()` |
+| `src/vmm/cpu.rs` | vCPU state capture/restore, live snapshot gate in run loop |
+| `src/sandbox/mod.rs` | `SandboxBuilder::snapshot()` builder method |
+| `src/agent_box.rs` | `VoidBox::snapshot()`, `warmup()`, warmup execution |
+| `src/spec.rs` | `SandboxSpec.snapshot`, `WarmupSpec`, `BoxSandboxOverride.snapshot` |
+| `src/runtime.rs` | `resolve_snapshot()`, `resolve_box_snapshot()`, warmup wiring |
+| `src/daemon.rs` | `CreateRunRequest.snapshot` API field |
+| `src/backend/control_channel.rs` | `wait_for_snapshot_ready()` |
+| `void-box-protocol/src/lib.rs` | `MessageType::SnapshotReady = 17` |
+| `guest-agent/src/main.rs` | Message type 17 dispatch handler |
 
 ## Developer Notes
 

@@ -73,6 +73,9 @@ pub struct BackendConfig {
     pub env: Vec<(String, String)>,
     /// Security configuration.
     pub security: BackendSecurityConfig,
+    /// Path to a snapshot directory to restore from (skips cold boot).
+    /// If `None`, the VM is cold-booted normally.
+    pub snapshot: Option<PathBuf>,
 }
 
 /// Security-relevant settings for the backend.

@@ -87,6 +87,7 @@ fn backend_config() -> Option<BackendConfig> {
             max_concurrent_connections: 64,
             seccomp: true,
         },
+        snapshot: None,
     })
 }
 

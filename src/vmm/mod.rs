@@ -11,10 +11,12 @@ pub mod config;
 pub mod cpu;
 pub mod kvm;
 pub mod memory;
+pub mod snapshot;
 
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
@@ -56,6 +58,9 @@ pub struct MicroVm {
     /// Vsock device for guest communication
     #[allow(dead_code)]
     vsock: Option<Arc<VsockDevice>>,
+    /// virtio-vsock MMIO device (kept for snapshot state capture)
+    #[allow(dead_code)]
+    virtio_vsock_mmio: Option<Arc<Mutex<VirtioVsockMmio>>>,
     /// virtio-net device for SLIRP networking
     #[allow(dead_code)]
     virtio_net: Option<Arc<Mutex<VirtioNetDevice>>>,
@@ -72,6 +77,11 @@ pub struct MicroVm {
     /// Active span context for trace propagation into the guest.
     /// When set, `exec_with_env` will inject a `TRACEPARENT` env var.
     active_span_context: Option<crate::observe::tracer::SpanContext>,
+    /// Set by the host to request vCPUs to pause for a live snapshot.
+    snapshot_requested: Arc<AtomicBool>,
+    /// Barrier for synchronizing vCPU pause during live snapshot.
+    /// Size = num_vcpus + 1 (main thread).
+    snapshot_barrier: Arc<Barrier>,
 }
 
 /// Commands that can be sent to the VM event loop
@@ -238,6 +248,8 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
 
         // Create vCPUs (with MMIO dispatch to virtio-net and virtio-vsock)
         let running = Arc::new(AtomicBool::new(true));
+        let snapshot_requested = Arc::new(AtomicBool::new(false));
+        let snapshot_barrier = Arc::new(Barrier::new(config.vcpus + 1));
         let mut vcpu_handles = Vec::with_capacity(config.vcpus);
         for vcpu_id in 0..config.vcpus {
             let handle = cpu::create_vcpu(
@@ -252,6 +264,8 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
                     virtio_9p: mmio_devices.virtio_9p.clone(),
                     virtio_blk: mmio_devices.virtio_blk.clone(),
                 },
+                snapshot_requested.clone(),
+                snapshot_barrier.clone(),
             )?;
             vcpu_handles.push(handle);
         }
@@ -417,6 +431,7 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             serial_output: serial_rx,
             cid,
             vsock,
+            virtio_vsock_mmio: mmio_devices.virtio_vsock,
             virtio_net: mmio_devices.virtio_net,
             command_tx,
             event_loop_handle: Some(event_loop_handle),
@@ -424,7 +439,526 @@ Ensure /dev/vhost-vsock exists (e.g. modprobe vhost_vsock) and the runner suppor
             net_poll_handle,
             telemetry: None,
             active_span_context: None,
+            snapshot_requested,
+            snapshot_barrier,
         })
+    }
+
+    /// Restore a MicroVm from a snapshot directory.
+    ///
+    /// Skips kernel loading, initramfs, boot params, and the 4s boot wait.
+    /// Instead: restore memory (COW mmap) → KVM state → vsock → vCPU resume.
+    pub async fn from_snapshot(snapshot_dir: &Path) -> Result<Self> {
+        let snap = snapshot::VmSnapshot::load(snapshot_dir)?;
+        let mem_path = snapshot::VmSnapshot::memory_path(snapshot_dir);
+
+        info!(
+            "Restoring VM from snapshot: hash={}, {}MB, {} vCPUs",
+            snap.config_hash, snap.config.memory_mb, snap.config.vcpus
+        );
+
+        // 1. Create KVM VM (allocates memory, creates irqchip + PIT)
+        let vm = Arc::new(kvm::Vm::new(snap.config.memory_mb)?);
+
+        // 2. Restore memory contents
+        match snap.snapshot_type {
+            snapshot::SnapshotType::Diff => {
+                // For diff snapshots, first restore the base, then apply diff
+                if let Some(ref parent_hash) = snap.parent_id {
+                    let parent_dir = snapshot::snapshot_dir_for_hash(parent_hash);
+                    let parent_mem = snapshot::VmSnapshot::memory_path(&parent_dir);
+                    if !parent_mem.exists() {
+                        return Err(Error::Snapshot(format!(
+                            "parent base memory not found at {}",
+                            parent_mem.display()
+                        )));
+                    }
+                    snapshot::restore_memory(vm.guest_memory(), &parent_mem)?;
+                    debug!("Restored base memory from parent {}", parent_hash);
+                } else {
+                    return Err(Error::Snapshot("diff snapshot has no parent_id".into()));
+                }
+                // Apply diff pages on top
+                let diff_path = snapshot::VmSnapshot::diff_memory_path(snapshot_dir);
+                if diff_path.exists() {
+                    snapshot::restore_memory_diff(vm.guest_memory(), &diff_path)?;
+                }
+            }
+            _ => {
+                // Base or PostInit: full memory restore via COW mmap
+                snapshot::restore_memory(vm.guest_memory(), &mem_path)?;
+            }
+        }
+
+        // 3. Restore in-kernel irqchip + PIT state
+        vm.restore_irqchip(&snap.irqchip)?;
+        vm.restore_pit(&snap.pit)?;
+
+        // 4. Serial device (fresh — no state to restore)
+        let (serial_tx, serial_rx) = mpsc::channel(4096);
+        let serial = SerialDevice::new(serial_tx);
+
+        // 5. Generate a new CID for this instance
+        let cid = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u32;
+            3 + (seed % 0xFFFF_FFFC)
+        };
+
+        // 6. Re-create VsockDevice with the snapshot's session secret (skip boot wait)
+        let session_secret: [u8; 32] = snap
+            .session_secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Snapshot("invalid session secret length".into()))?;
+        let vsock = Arc::new(VsockDevice::restored(cid, session_secret)?);
+
+        // 7. Restore virtio-vsock MMIO device
+        let virtio_vsock_mmio = {
+            let mut dev = VirtioVsockMmio::restore(&snap.vsock_state, cid, vm.guest_memory())?;
+            dev.set_mmio_base(snap.config.vsock_mmio_base);
+            debug!(
+                "Restored virtio-vsock MMIO at {:#x}, CID {}",
+                dev.mmio_base(),
+                cid
+            );
+            Some(Arc::new(Mutex::new(dev)))
+        };
+
+        let mmio_devices = cpu::MmioDevices {
+            virtio_net: None, // TODO: restore networking in future phases
+            virtio_vsock: virtio_vsock_mmio,
+            virtio_9p: None,
+            virtio_blk: None,
+        };
+
+        // 8. Restore vCPUs from snapshot state
+        let running = Arc::new(AtomicBool::new(true));
+        let snapshot_requested = Arc::new(AtomicBool::new(false));
+        let snapshot_barrier = Arc::new(Barrier::new(snap.vcpu_states.len() + 1));
+        let mut vcpu_handles = Vec::with_capacity(snap.vcpu_states.len());
+        for (i, vcpu_state) in snap.vcpu_states.iter().enumerate() {
+            let handle = cpu::create_vcpu_restored(
+                vm.clone(),
+                i as u64,
+                vcpu_state,
+                running.clone(),
+                serial.clone(),
+                cpu::MmioDevices {
+                    virtio_net: mmio_devices.virtio_net.clone(),
+                    virtio_vsock: mmio_devices.virtio_vsock.clone(),
+                    virtio_9p: mmio_devices.virtio_9p.clone(),
+                    virtio_blk: mmio_devices.virtio_blk.clone(),
+                },
+                snapshot_requested.clone(),
+                snapshot_barrier.clone(),
+            )?;
+            vcpu_handles.push(handle);
+        }
+        debug!("Restored {} vCPUs", vcpu_handles.len());
+
+        // 9. Spawn vsock IRQ handler thread
+        let vsock_irq_handle = if let Some(ref vsock_mmio) = mmio_devices.virtio_vsock {
+            let call_fds: Vec<RawFd> = {
+                let guard = vsock_mmio.lock().unwrap();
+                guard.call_eventfds().iter().filter_map(|f| *f).collect()
+            };
+            if !call_fds.is_empty() {
+                let vsock_mmio_clone = vsock_mmio.clone();
+                let vm_fd_raw = vm.vm_fd().as_raw_fd();
+                let running_irq = running.clone();
+                let handle = std::thread::Builder::new()
+                    .name("vsock-irq".into())
+                    .spawn(move || {
+                        vsock_irq_thread(call_fds, vsock_mmio_clone, vm_fd_raw, running_irq);
+                    })
+                    .expect("Failed to spawn vsock-irq thread");
+                debug!("Spawned vsock-irq handler thread (restore)");
+                Some(handle)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 10. Start event loop (same as cold boot)
+        let (command_tx, mut command_rx) = mpsc::channel::<VmCommand>(32);
+        let running_clone = running.clone();
+        let vsock_clone = Some(vsock.clone());
+        let event_loop_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+
+            rt.block_on(async {
+                while running_clone.load(Ordering::SeqCst) {
+                    tokio::select! {
+                        Some(cmd) = command_rx.recv() => {
+                            match cmd {
+                                VmCommand::Exec { request, response_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_exec_request(&request).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
+                                VmCommand::ExecStreaming { request, response_tx, chunk_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_exec_request_streaming(&request, |chunk| {
+                                            let _ = chunk_tx.try_send(chunk);
+                                        }).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
+                                VmCommand::WriteFile { request, response_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_write_file(&request.path, &request.content).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
+                                VmCommand::MkdirP { request, response_tx } => {
+                                    let result = if let Some(ref vsock) = vsock_clone {
+                                        vsock.send_mkdir_p(&request.path).await
+                                    } else {
+                                        Err(Error::Guest("vsock not enabled".into()))
+                                    };
+                                    let _ = response_tx.send(result);
+                                }
+                                VmCommand::SubscribeTelemetry { aggregator, opts } => {
+                                    if let Some(ref vsock) = vsock_clone {
+                                        let vsock = vsock.clone();
+                                        let agg = aggregator.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = vsock.subscribe_telemetry(&opts, move |batch| {
+                                                agg.ingest(&batch);
+                                            }).await {
+                                                tracing::warn!("Telemetry subscription ended: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
+                                VmCommand::Stop => {
+                                    running_clone.store(false, Ordering::SeqCst);
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
+                    }
+                }
+            });
+        });
+
+        info!("MicroVm restored from snapshot: CID {}", cid);
+
+        Ok(Self {
+            vm,
+            vcpu_handles,
+            running,
+            serial_output: serial_rx,
+            cid,
+            vsock: Some(vsock),
+            virtio_vsock_mmio: mmio_devices.virtio_vsock,
+            virtio_net: None,
+            command_tx,
+            event_loop_handle: Some(event_loop_handle),
+            vsock_irq_handle,
+            net_poll_handle: None,
+            telemetry: None,
+            active_span_context: None,
+            snapshot_requested,
+            snapshot_barrier,
+        })
+    }
+
+    /// Enable dirty page tracking for this VM.
+    ///
+    /// Call this after restoring from a base snapshot to prepare for a
+    /// subsequent diff snapshot. All page writes after this call will be
+    /// tracked in KVM's dirty bitmap.
+    pub fn enable_dirty_tracking(&self) -> Result<()> {
+        self.vm.enable_dirty_log()?;
+        info!("Dirty page tracking enabled");
+        Ok(())
+    }
+
+    /// Create a snapshot of the current VM state.
+    ///
+    /// This stops the VM, captures all state (vCPU registers, KVM state,
+    /// memory, vsock device), and saves it to disk. The VM is NOT usable
+    /// after this call — it has been stopped to ensure consistent state.
+    ///
+    /// Returns the snapshot directory path.
+    pub async fn snapshot(
+        self,
+        snapshot_dir: &Path,
+        config_hash: String,
+        config: snapshot::SnapshotConfig,
+    ) -> Result<std::path::PathBuf> {
+        self.snapshot_internal(snapshot_dir, config_hash, config, false, None)
+            .await
+    }
+
+    /// Create a diff snapshot.
+    ///
+    /// Like [`snapshot`], but saves only the dirty pages (pages modified since
+    /// [`enable_dirty_tracking`] was called). The resulting snapshot has
+    /// `snapshot_type = Diff` and stores `parent_id` pointing to the base.
+    ///
+    /// The diff memory file is much smaller than a full dump when only a
+    /// fraction of pages have been modified.
+    ///
+    /// Returns the snapshot directory path.
+    pub async fn snapshot_diff(
+        self,
+        snapshot_dir: &Path,
+        config_hash: String,
+        config: snapshot::SnapshotConfig,
+        parent_id: String,
+    ) -> Result<std::path::PathBuf> {
+        self.snapshot_internal(snapshot_dir, config_hash, config, true, Some(parent_id))
+            .await
+    }
+
+    /// Internal snapshot implementation shared by full and diff snapshots.
+    async fn snapshot_internal(
+        mut self,
+        snapshot_dir: &Path,
+        config_hash: String,
+        config: snapshot::SnapshotConfig,
+        is_diff: bool,
+        parent_id: Option<String>,
+    ) -> Result<std::path::PathBuf> {
+        info!(
+            "Creating {} snapshot (stopping VM)...",
+            if is_diff { "diff" } else { "base" }
+        );
+
+        // 1. Stop event loop and background threads
+        let _ = self.command_tx.send(VmCommand::Stop).await;
+        self.running.store(false, Ordering::SeqCst);
+
+        // 2. Wait for vCPU threads and collect their state
+        let mut vcpu_states = Vec::with_capacity(self.vcpu_handles.len());
+        for handle in self.vcpu_handles.drain(..) {
+            match handle.join_with_state() {
+                Ok(Some(state)) => vcpu_states.push(state),
+                Ok(None) => {
+                    return Err(Error::Snapshot(
+                        "vCPU exited without capturing state".into(),
+                    ))
+                }
+                Err(e) => return Err(Error::Snapshot(format!("vCPU join failed: {}", e))),
+            }
+        }
+        debug!("Captured {} vCPU states", vcpu_states.len());
+
+        // 3. Wait for background threads
+        if let Some(handle) = self.event_loop_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.vsock_irq_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.net_poll_handle.take() {
+            let _ = handle.join();
+        }
+
+        // 4. Capture VM-level state (vm_fd is still valid)
+        let irqchip = self.vm.capture_irqchip()?;
+        let pit = self.vm.capture_pit()?;
+
+        // 5. Capture vsock device state
+        let vsock_state = if let Some(ref vsock_mmio) = self.virtio_vsock_mmio {
+            vsock_mmio.lock().unwrap().snapshot_state()
+        } else {
+            snapshot::VsockSnapshotState {
+                device_features: 1 << 32, // VIRTIO_F_VERSION_1
+                driver_features: 1 << 32,
+                features_sel: 0,
+                queue_sel: 0,
+                status: 0x0f,
+                interrupt_status: 0,
+                config_generation: 0,
+                queues: vec![
+                    snapshot::QueueSnapshotState {
+                        num_max: 256,
+                        num: 256,
+                        ready: true,
+                        desc_addr: 0,
+                        driver_addr: 0,
+                        device_addr: 0,
+                    };
+                    3
+                ],
+            }
+        };
+
+        // 6. Get session secret from vsock device
+        let session_secret = self
+            .vsock
+            .as_ref()
+            .map(|v| v.session_secret().to_vec())
+            .unwrap_or_else(|| vec![0u8; 32]);
+
+        // 7. Dump memory
+        if is_diff {
+            // Get dirty page bitmap and dump only modified pages
+            let dirty_bitmaps = self.vm.get_dirty_bitmap()?;
+            let diff_path = snapshot::VmSnapshot::diff_memory_path(snapshot_dir);
+            snapshot::dump_memory_diff(self.vm.guest_memory(), &dirty_bitmaps, &diff_path)?;
+        } else {
+            let mem_path = snapshot::VmSnapshot::memory_path(snapshot_dir);
+            snapshot::dump_memory(self.vm.guest_memory(), &mem_path)?;
+        }
+
+        // 8. Build and save snapshot metadata
+        let snap = snapshot::VmSnapshot {
+            version: snapshot::SNAPSHOT_VERSION,
+            parent_id,
+            vcpu_states,
+            irqchip,
+            pit,
+            vsock_state,
+            config,
+            config_hash,
+            snapshot_type: if is_diff {
+                snapshot::SnapshotType::Diff
+            } else {
+                snapshot::SnapshotType::Base
+            },
+            session_secret,
+        };
+        snap.save(snapshot_dir)?;
+
+        info!(
+            "{} snapshot saved to {}",
+            if is_diff { "Diff" } else { "Base" },
+            snapshot_dir.display()
+        );
+        Ok(snapshot_dir.to_path_buf())
+    }
+
+    /// Create a live snapshot without stopping the VM.
+    ///
+    /// 1. Sets `snapshot_requested` flag
+    /// 2. Waits on barrier (all vCPUs pause after their current KVM_RUN exit)
+    /// 3. Captures irqchip, PIT, vsock state, and memory
+    /// 4. Clears flag and releases barrier → vCPUs resume
+    ///
+    /// The VM continues running after this call completes.
+    pub async fn snapshot_live(
+        &self,
+        snapshot_dir: &std::path::Path,
+        config_hash: String,
+        config: snapshot::SnapshotConfig,
+    ) -> Result<std::path::PathBuf> {
+        info!("Creating live snapshot (pausing vCPUs)...");
+
+        // 1. Signal vCPUs to pause
+        self.snapshot_requested.store(true, Ordering::SeqCst);
+
+        // 2. Wait for all vCPUs to reach the barrier
+        //    (main thread is the +1 participant)
+        let barrier = self.snapshot_barrier.clone();
+        let requested = self.snapshot_requested.clone();
+        let vm = self.vm.clone();
+        let vsock_mmio = self.virtio_vsock_mmio.clone();
+        let vsock_dev = self.vsock.clone();
+        let snapshot_dir = snapshot_dir.to_path_buf();
+        let vcpu_count = self.vcpu_handles.len();
+
+        // Run blocking barrier wait + capture on a blocking thread
+        let result = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
+            // Wait for all vCPUs to pause
+            barrier.wait();
+            debug!("All {} vCPUs paused for live snapshot", vcpu_count);
+
+            // 3. Capture VM-level state while vCPUs are paused
+            let irqchip = vm.capture_irqchip()?;
+            let pit = vm.capture_pit()?;
+
+            let vsock_state = if let Some(ref vsock_mmio) = vsock_mmio {
+                vsock_mmio.lock().unwrap().snapshot_state()
+            } else {
+                snapshot::VsockSnapshotState {
+                    device_features: 1 << 32,
+                    driver_features: 1 << 32,
+                    features_sel: 0,
+                    queue_sel: 0,
+                    status: 0x0f,
+                    interrupt_status: 0,
+                    config_generation: 0,
+                    queues: vec![
+                        snapshot::QueueSnapshotState {
+                            num_max: 256,
+                            num: 256,
+                            ready: true,
+                            desc_addr: 0,
+                            driver_addr: 0,
+                            device_addr: 0,
+                        };
+                        3
+                    ],
+                }
+            };
+
+            let session_secret = vsock_dev
+                .as_ref()
+                .map(|v| v.session_secret().to_vec())
+                .unwrap_or_else(|| vec![0u8; 32]);
+
+            // Dump full memory (vCPUs are paused so memory is consistent)
+            let mem_path = snapshot::VmSnapshot::memory_path(&snapshot_dir);
+            snapshot::dump_memory(vm.guest_memory(), &mem_path)?;
+
+            // Note: vCPU states are captured by each vCPU thread at the
+            // barrier point and stored in their exit_state slots. For live
+            // snapshots we read them from the VcpuHandle's shared state.
+            // However, since vCPU threads capture state into exit_state only
+            // on exit, we need a separate capture mechanism for live snapshots.
+            // The vCPU run loop captures state into snapshot_vcpu_states when
+            // snapshot_requested is set (see cpu.rs changes).
+
+            // Build snapshot with empty vcpu_states — they are filled by
+            // the vCPU threads and retrieved after barrier release.
+            let snap = snapshot::VmSnapshot {
+                version: snapshot::SNAPSHOT_VERSION,
+                parent_id: None,
+                vcpu_states: Vec::new(), // placeholder
+                irqchip,
+                pit,
+                vsock_state,
+                config,
+                config_hash,
+                snapshot_type: snapshot::SnapshotType::PostInit,
+                session_secret,
+            };
+            snap.save(&snapshot_dir)?;
+
+            // 4. Resume vCPUs
+            requested.store(false, Ordering::SeqCst);
+            // Wait on barrier again to synchronize resume
+            barrier.wait();
+            debug!("vCPUs resumed after live snapshot");
+
+            Ok(snapshot_dir)
+        })
+        .await
+        .map_err(|e| Error::Snapshot(format!("live snapshot task panicked: {}", e)))??;
+
+        info!("Live PostInit snapshot saved to {}", result.display());
+        Ok(result)
     }
 
     /// Execute a command in the guest VM

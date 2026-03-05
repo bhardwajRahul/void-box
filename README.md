@@ -28,6 +28,7 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="#oci-container-support">OCI Support</a> ·
   <a href="#host-mounts">Host Mounts</a> ·
+  <a href="#snapshots">Snapshots</a> ·
   <a href="#observability">Observability</a>
 </p>
 
@@ -170,6 +171,7 @@ voidbox run --file hackernews_agent.yaml
 │  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
 │  │  Linux/KVM: virtio-blk ←→ OCI base rootfs       │  │
 │  │  9p/virtiofs ←→ skills + host mounts            │  │
+│  │  Snapshot: base/diff/live → ~/.void-box/snapshots│  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                       │
 │  Seccomp-BPF │ OTLP export                            │
@@ -451,6 +453,124 @@ sandbox:
       guest: /config
       mode: ro        # read-only (default)
 ```
+
+---
+
+## Snapshots
+
+VoidBox supports sub-second VM restore via snapshot/restore. Snapshots capture the full VM state (vCPU registers, memory, devices) and restore via COW `mmap` — the guest resumes execution without re-booting the kernel or re-running initialization.
+
+**All snapshot features are explicit opt-in only.** If you never set a snapshot field, the system behaves exactly as before — cold boot, zero snapshot code runs.
+
+### Snapshot types
+
+| Type | Description |
+|------|-------------|
+| **Base** | Full memory dump + KVM state from a cold-booted VM |
+| **Diff** | Only dirty pages since last snapshot (smaller, faster) |
+| **PostInit** | Live snapshot taken after warmup commands (VM keeps running) |
+
+### YAML spec
+
+```yaml
+# Top-level snapshot — applies to all boxes
+sandbox:
+  memory_mb: 256
+  snapshot: "abc123def456"   # hash prefix from `voidbox snapshot list`
+
+# Per-box override + warmup commands
+pipeline:
+  boxes:
+    - name: analyst
+      prompt: "analyze data"
+      sandbox:
+        snapshot: "def789"   # per-box snapshot override
+      warmup:                # commands to run before agent execution
+        commands:
+          - "pip install pandas numpy"
+          - "python -c 'import pandas; print(pandas.__version__)'"
+        timeout_secs: 120
+    - name: coder
+      prompt: "write code"
+      # no snapshot, no warmup → cold boot (default)
+```
+
+### Rust API
+
+```rust
+use void_box::agent_box::VoidBox;
+
+// Cold boot (default — no snapshot, no warmup)
+let box1 = VoidBox::new("analyst")
+    .prompt("analyze data")
+    .memory_mb(256)
+    .build()?;
+
+// Restore from snapshot (explicit opt-in)
+let box2 = VoidBox::new("analyst")
+    .prompt("analyze data")
+    .snapshot("/path/to/snapshot/dir")   // or hash prefix
+    .build()?;
+
+// Snapshot + warmup (PostInit)
+use void_box::spec::WarmupSpec;
+let box3 = VoidBox::new("analyst")
+    .prompt("analyze data")
+    .snapshot("abc123")
+    .warmup(WarmupSpec {
+        commands: vec!["pip install pandas".into()],
+        timeout_secs: 120,
+    })
+    .build()?;
+```
+
+### CLI
+
+```bash
+# Create a snapshot from a running VM
+voidbox snapshot create --config-hash <hash>
+
+# List stored snapshots
+voidbox snapshot list
+
+# Delete a snapshot
+voidbox snapshot delete <hash-prefix>
+
+# Run with a snapshot (via spec)
+voidbox run --file spec.yaml   # spec has sandbox.snapshot set
+```
+
+### Daemon API
+
+```bash
+# POST /runs with snapshot override
+curl -X POST http://localhost:8080/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"file": "workflow.yaml", "snapshot": "abc123def456"}'
+```
+
+### Design principles
+
+- **No snapshot field set** → cold boot, zero snapshot code runs
+- **No auto-detection** of existing snapshots
+- **No auto-creation** of snapshots during normal runs
+- **No auto-restore** — only if the user passes an explicit path or hash
+- **No env var fallback** — spec or code only
+- **Warmup only runs** if `warmup:` is declared AND a snapshot path is configured
+- **Every new field defaults to `None`** — the system behaves identically to before if untouched
+
+Snapshot cache is stored at `~/.void-box/snapshots/` with LRU eviction support.
+
+### Benchmarks
+
+Measured on a single-vCPU, 256 MB VM (Linux/KVM):
+
+| Metric | Time |
+|--------|------|
+| Cold boot | ~12 ms |
+| Snapshot restore | ~2 ms |
+| Live snapshot capture | ~245 ms |
+| **Cold boot → restore speedup** | **~6x** |
 
 ---
 

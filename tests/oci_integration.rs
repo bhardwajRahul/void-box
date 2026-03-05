@@ -324,6 +324,7 @@ fn vz_test_backend_config() -> void_box::backend::BackendConfig {
             max_concurrent_connections: 64,
             seccomp: false,
         },
+        snapshot: None,
     }
 }
 

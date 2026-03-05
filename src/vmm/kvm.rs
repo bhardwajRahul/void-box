@@ -1,10 +1,14 @@
 //! KVM setup and VM management
 
-use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
+use kvm_bindings::{
+    kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
+    KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
+};
 use kvm_ioctls::{Kvm, VmFd};
 use tracing::debug;
 use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
+use crate::vmm::snapshot::{kvm_struct_from_bytes, kvm_struct_to_bytes, IrqchipState};
 use crate::{Error, Result};
 
 /// x86_64 memory layout constants
@@ -186,6 +190,160 @@ impl Vm {
     /// Create a vCPU for this VM
     pub fn create_vcpu(&self, id: u64) -> Result<kvm_ioctls::VcpuFd> {
         self.vm_fd.create_vcpu(id).map_err(Error::Kvm)
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot: IRQchip + PIT capture / restore
+    // ------------------------------------------------------------------
+
+    /// Capture the in-kernel irqchip state (PIC master, PIC slave, IOAPIC).
+    pub fn capture_irqchip(&self) -> Result<IrqchipState> {
+        let pic_master = self.get_irqchip_raw(0)?; // KVM_IRQCHIP_PIC_MASTER
+        let pic_slave = self.get_irqchip_raw(1)?; // KVM_IRQCHIP_PIC_SLAVE
+        let ioapic = self.get_irqchip_raw(2)?; // KVM_IRQCHIP_IOAPIC
+        debug!(
+            "Captured irqchip state ({} + {} + {} bytes)",
+            pic_master.len(),
+            pic_slave.len(),
+            ioapic.len()
+        );
+        Ok(IrqchipState {
+            pic_master,
+            pic_slave,
+            ioapic,
+        })
+    }
+
+    /// Restore the in-kernel irqchip state from a snapshot.
+    pub fn restore_irqchip(&self, state: &IrqchipState) -> Result<()> {
+        self.set_irqchip_raw(0, &state.pic_master)?;
+        self.set_irqchip_raw(1, &state.pic_slave)?;
+        self.set_irqchip_raw(2, &state.ioapic)?;
+        debug!("Restored irqchip state");
+        Ok(())
+    }
+
+    /// Capture PIT (Programmable Interval Timer) state.
+    pub fn capture_pit(&self) -> Result<Vec<u8>> {
+        let pit = self.vm_fd.get_pit2().map_err(Error::Kvm)?;
+        let bytes = kvm_struct_to_bytes(&pit);
+        debug!("Captured PIT state ({} bytes)", bytes.len());
+        Ok(bytes)
+    }
+
+    /// Restore PIT state from a snapshot.
+    pub fn restore_pit(&self, data: &[u8]) -> Result<()> {
+        let pit: kvm_pit_state2 = kvm_struct_from_bytes(data)?;
+        self.vm_fd.set_pit2(&pit).map_err(Error::Kvm)?;
+        debug!("Restored PIT state");
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot: dirty page tracking
+    // ------------------------------------------------------------------
+
+    /// Enable dirty page logging on all memory regions.
+    ///
+    /// After this call, KVM tracks which guest pages are written to.
+    /// Use [`get_dirty_bitmap`] to retrieve the bitmap of modified pages.
+    pub fn enable_dirty_log(&self) -> Result<()> {
+        for (index, region) in self.guest_memory.iter().enumerate() {
+            let memory_region = kvm_userspace_memory_region {
+                slot: index as u32,
+                guest_phys_addr: region.start_addr().raw_value(),
+                memory_size: region.len(),
+                userspace_addr: self
+                    .guest_memory
+                    .get_host_address(region.start_addr())
+                    .unwrap() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(memory_region)
+                    .map_err(Error::Kvm)?;
+            }
+
+            debug!(
+                "Enabled dirty log on memory slot {}: addr={:#x}, size={:#x}",
+                index,
+                region.start_addr().raw_value(),
+                region.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Disable dirty page logging on all memory regions.
+    ///
+    /// Re-registers memory regions without the `KVM_MEM_LOG_DIRTY_PAGES` flag.
+    pub fn disable_dirty_log(&self) -> Result<()> {
+        for (index, region) in self.guest_memory.iter().enumerate() {
+            let memory_region = kvm_userspace_memory_region {
+                slot: index as u32,
+                guest_phys_addr: region.start_addr().raw_value(),
+                memory_size: region.len(),
+                userspace_addr: self
+                    .guest_memory
+                    .get_host_address(region.start_addr())
+                    .unwrap() as u64,
+                flags: 0,
+            };
+
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(memory_region)
+                    .map_err(Error::Kvm)?;
+            }
+        }
+        debug!("Disabled dirty log on all memory slots");
+        Ok(())
+    }
+
+    /// Retrieve the dirty page bitmap for all memory slots.
+    ///
+    /// Returns a vector of `(slot_index, bitmap)` pairs. Each bit in the
+    /// bitmap corresponds to one 4 KiB page: bit N = 1 means page N was
+    /// written since the last `get_dirty_bitmap` or `enable_dirty_log` call.
+    ///
+    /// The bitmap is a `Vec<u64>` where each u64 covers 64 pages (256 KiB).
+    pub fn get_dirty_bitmap(&self) -> Result<Vec<(u32, Vec<u64>)>> {
+        let mut result = Vec::new();
+        for (index, region) in self.guest_memory.iter().enumerate() {
+            let slot = index as u32;
+            let mem_size = region.len() as usize;
+            let bitmap = self
+                .vm_fd
+                .get_dirty_log(slot, mem_size)
+                .map_err(Error::Kvm)?;
+            let dirty_count: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+            debug!(
+                "Dirty bitmap slot {}: {} pages dirty out of {} total",
+                slot,
+                dirty_count,
+                mem_size / 4096
+            );
+            result.push((slot, bitmap));
+        }
+        Ok(result)
+    }
+
+    fn get_irqchip_raw(&self, chip_id: u32) -> Result<Vec<u8>> {
+        let mut chip = kvm_irqchip {
+            chip_id,
+            ..Default::default()
+        };
+        self.vm_fd.get_irqchip(&mut chip).map_err(Error::Kvm)?;
+        Ok(kvm_struct_to_bytes(&chip))
+    }
+
+    fn set_irqchip_raw(&self, chip_id: u32, data: &[u8]) -> Result<()> {
+        let mut chip: kvm_irqchip = kvm_struct_from_bytes(data)?;
+        chip.chip_id = chip_id; // ensure chip_id matches
+        self.vm_fd.set_irqchip(&chip).map_err(Error::Kvm)?;
+        Ok(())
     }
 }
 

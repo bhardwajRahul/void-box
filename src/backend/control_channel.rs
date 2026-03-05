@@ -334,6 +334,38 @@ impl ControlChannel {
         }
     }
 
+    /// Wait for the guest to signal snapshot readiness.
+    ///
+    /// Connects and sends a `SnapshotReady` message, then waits for the
+    /// guest to reply with `SnapshotReady`. Returns `Ok(())` on success.
+    /// Used for guest-initiated snapshot readiness signaling.
+    pub async fn wait_for_snapshot_ready(&self, timeout: Duration) -> Result<()> {
+        let mut stream = self
+            .connect_with_handshake(Duration::from_secs(3), "snapshot-ready")
+            .await?;
+
+        let _ = stream.set_read_timeout(Some(timeout));
+
+        let message = Message {
+            msg_type: MessageType::SnapshotReady,
+            payload: Vec::new(),
+        };
+        stream
+            .write_all(&message.serialize())
+            .map_err(|e| Error::Guest(format!("Failed to send SnapshotReady: {}", e)))?;
+
+        let response_msg = Message::read_from_sync(&mut *stream)?;
+        if response_msg.msg_type != MessageType::SnapshotReady {
+            return Err(Error::Guest(format!(
+                "Unexpected response for SnapshotReady: {:?}",
+                response_msg.msg_type
+            )));
+        }
+
+        debug!("control_channel: guest confirmed SnapshotReady");
+        Ok(())
+    }
+
     /// Connect to the guest agent and perform a Ping/Pong handshake.
     async fn connect_with_handshake(
         &self,

@@ -123,6 +123,7 @@ fn build_config_with_mount(
             max_concurrent_connections: 64,
             seccomp: true,
         },
+        snapshot: None,
     })
 }
 

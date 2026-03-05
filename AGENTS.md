@@ -173,6 +173,102 @@ pattern, e.g. `[workflow:my-flow] step 1/3: "build" running...`.
   `resolve_oci_rootfs_plan` (~line 776), `apply_oci_rootfs` (~line 745)
 - `src/backend/vz/backend.rs` — VZ virtiofs mount setup
 
+## Snapshot / restore
+
+VoidBox supports three snapshot types: **Base** (full dump), **Diff** (dirty pages
+only), and **PostInit** (live capture while VM keeps running). All snapshot
+features are **explicit opt-in** — no snapshot code runs unless the user sets a
+snapshot field.
+
+### Design principle
+
+Every snapshot-related field defaults to `None`. No auto-detection, no env var
+fallback, no implicit behavior. The system behaves identically to before if no
+snapshot field is set.
+
+### Opt-in layers
+
+Snapshots can be enabled at any layer of the stack:
+
+| Layer | Field | Where |
+|-------|-------|-------|
+| Builder API | `SandboxBuilder::snapshot(path)` | `src/sandbox/mod.rs` |
+| VoidBox API | `VoidBox::snapshot(path)`, `VoidBox::warmup(spec)` | `src/agent_box.rs` |
+| YAML spec | `sandbox.snapshot`, `warmup.commands` | `src/spec.rs` |
+| Per-box override | `sandbox.snapshot` in `BoxSandboxOverride` | `src/spec.rs` |
+| Runtime | `resolve_snapshot()`, `resolve_box_snapshot()` | `src/runtime.rs` |
+| Daemon API | `CreateRunRequest.snapshot` | `src/daemon.rs` |
+
+### Snapshot resolution
+
+`resolve_snapshot()` in `src/runtime.rs` resolves a snapshot string:
+
+1. Try as hash prefix → `~/.void-box/snapshots/<prefix>/` (if `state.bin` exists)
+2. Try as literal directory path (if `state.bin` exists)
+3. Neither found → print warning, return `None` (cold boot)
+
+Per-box overrides (`resolve_box_snapshot()`) take priority over top-level spec.
+
+### Live snapshot internals (PostInit)
+
+`MicroVm::snapshot_live()` in `src/vmm/mod.rs`:
+
+1. Sets `snapshot_requested: Arc<AtomicBool>` flag
+2. Each vCPU thread checks the flag after every `KVM_RUN` exit (gate in
+   `vcpu_run_loop` in `src/vmm/cpu.rs`)
+3. vCPU captures its own state, then waits on `snapshot_barrier: Arc<Barrier>`
+4. Main thread waits on same barrier → all vCPUs paused
+5. Main thread captures irqchip, PIT, vsock state, dumps memory
+6. Main thread clears flag, releases barrier → vCPUs resume
+
+### Warmup commands
+
+`WarmupSpec` in `src/spec.rs`:
+
+```yaml
+warmup:
+  commands:
+    - "pip install pandas"
+    - "python -c 'import pandas'"
+  timeout_secs: 120
+```
+
+Warmup runs in `VoidBox::run()` (in `src/agent_box.rs`) **before** security
+provisioning and agent execution. Each command runs via `sandbox.exec("sh", ["-c", cmd])`.
+If any command fails (non-zero exit), the entire run fails.
+
+### Wire protocol
+
+`SnapshotReady = 17` in `void-box-protocol/src/lib.rs`. Guest-agent handles
+message type 17 as a no-op ack (sends `SnapshotReady` back). Host-side
+`ControlChannel::wait_for_snapshot_ready()` in `src/backend/control_channel.rs`
+connects and round-trips the message.
+
+### Key source files (snapshot)
+
+| File | Contents |
+|------|----------|
+| `src/vmm/snapshot.rs` | Types, memory dump/restore, diff support, cache/LRU |
+| `src/vmm/mod.rs` | `snapshot()`, `from_snapshot()`, `snapshot_live()` |
+| `src/vmm/cpu.rs` | vCPU state capture/restore, live snapshot gate |
+| `src/sandbox/mod.rs` | `SandboxBuilder::snapshot()` |
+| `src/agent_box.rs` | `VoidBox::snapshot()`, `warmup()`, warmup execution |
+| `src/spec.rs` | `SandboxSpec.snapshot`, `WarmupSpec`, `BoxSandboxOverride.snapshot` |
+| `src/runtime.rs` | `resolve_snapshot()`, `resolve_box_snapshot()` |
+| `src/daemon.rs` | `CreateRunRequest.snapshot` |
+| `src/backend/control_channel.rs` | `wait_for_snapshot_ready()` |
+| `void-box-protocol/src/lib.rs` | `MessageType::SnapshotReady = 17` |
+| `guest-agent/src/main.rs` | Message type 17 dispatch |
+
+### Security considerations
+
+- **RNG entropy**: Cloned VMs share `/dev/urandom` state. Mitigated by fresh CID
+  + session secret per restore and hardware RDRAND.
+- **ASLR**: Clones share page table layout. Mitigated by short-lived tasks,
+  SLIRP NAT isolation, and command allowlists.
+- **Session secret**: Each restored VM gets a unique secret via kernel cmdline;
+  the snapshot's stored secret is for state continuity, not auth reuse.
+
 ## Testing
 
 Static quality:
