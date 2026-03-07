@@ -169,6 +169,10 @@ pub enum Error {
     #[error("Sandbox error: {0}")]
     Sandbox(String),
 
+    /// Snapshot errors
+    #[error("Snapshot error: {0}")]
+    Snapshot(String),
+
     /// Observability errors
     #[error("Observability error: {0}")]
     Observe(String),

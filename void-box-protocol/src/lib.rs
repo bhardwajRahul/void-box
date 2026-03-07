@@ -133,6 +133,8 @@ pub enum MessageType {
     ExecOutputChunk = 15,
     /// Ack from host (optional flow control)
     ExecOutputAck = 16,
+    /// Guest signals that it is ready for a snapshot (Phase 3: PostInit).
+    SnapshotReady = 17,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -156,6 +158,7 @@ impl TryFrom<u8> for MessageType {
             14 => Ok(MessageType::MkdirPResponse),
             15 => Ok(MessageType::ExecOutputChunk),
             16 => Ok(MessageType::ExecOutputAck),
+            17 => Ok(MessageType::SnapshotReady),
             _ => Err(ProtocolError::UnknownMessageType(byte)),
         }
     }
@@ -536,7 +539,7 @@ mod tests {
     #[test]
     fn message_type_try_from_invalid() {
         assert!(MessageType::try_from(0).is_err());
-        assert!(MessageType::try_from(17).is_err());
+        assert!(MessageType::try_from(18).is_err());
         assert!(MessageType::try_from(255).is_err());
     }
 

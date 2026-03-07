@@ -63,6 +63,8 @@ struct VhostVringAddr {
     log_guest_addr: u64,
 }
 
+use crate::vmm::snapshot::{QueueSnapshotState, VsockSnapshotState};
+
 /// Queue state for virtio-vsock (rx=0, tx=1, event=2)
 #[derive(Default)]
 struct QueueState {
@@ -672,6 +674,127 @@ impl VirtioVsockMmio {
         } else {
             warn!("virtio-vsock: invalid queue notify {}", queue_index);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot support
+    // ------------------------------------------------------------------
+
+    /// Capture the device software state for snapshotting.
+    ///
+    /// FDs (vhost, eventfds) are NOT included — they are re-created on restore.
+    pub fn snapshot_state(&self) -> VsockSnapshotState {
+        let queues = [&self.rx_queue, &self.tx_queue, &self.event_queue]
+            .iter()
+            .map(|q| QueueSnapshotState {
+                num_max: q.num_max,
+                num: q.num,
+                ready: q.ready,
+                desc_addr: q.desc_addr,
+                driver_addr: q.driver_addr,
+                device_addr: q.device_addr,
+            })
+            .collect();
+
+        VsockSnapshotState {
+            device_features: self.device_features,
+            driver_features: self.driver_features,
+            features_sel: self.features_sel,
+            queue_sel: self.queue_sel,
+            status: self.status,
+            interrupt_status: self.interrupt_status,
+            config_generation: self.config_generation,
+            queues,
+        }
+    }
+
+    /// Restore a virtio-vsock MMIO device from snapshot state.
+    ///
+    /// Creates a new vhost-vsock FD with the given `cid`, restores software
+    /// state from the snapshot, and replays vhost ioctls to re-program the
+    /// vring addresses using the restored guest memory.
+    pub fn restore(
+        state: &VsockSnapshotState,
+        cid: u32,
+        guest_memory: &vm_memory::GuestMemoryMmap,
+    ) -> Result<Self> {
+        let (vhost_fd, kick_eventfds, call_eventfds) = Self::setup_vhost(cid, true)?;
+
+        // Restore queue software state from snapshot.
+        fn restore_queue(snap: &QueueSnapshotState) -> QueueState {
+            QueueState {
+                num_max: snap.num_max,
+                num: snap.num,
+                ready: snap.ready,
+                desc_addr: snap.desc_addr,
+                driver_addr: snap.driver_addr,
+                device_addr: snap.device_addr,
+            }
+        }
+
+        let rx_queue = state.queues.first().map(restore_queue).unwrap_or_default();
+        let tx_queue = state.queues.get(1).map(restore_queue).unwrap_or_default();
+        let event_queue = state.queues.get(2).map(restore_queue).unwrap_or_default();
+
+        let mut dev = Self {
+            cid,
+            vhost_fd,
+            kick_eventfds,
+            _call_eventfds: call_eventfds,
+            device_features: state.device_features,
+            driver_features: state.driver_features,
+            features_sel: state.features_sel,
+            queue_sel: state.queue_sel,
+            status: state.status,
+            interrupt_status: state.interrupt_status,
+            config_generation: state.config_generation,
+            rx_queue,
+            tx_queue,
+            event_queue,
+            mmio_base: 0,
+            mmio_size: 0x200,
+            vhost_attached: false,
+        };
+
+        // Re-attach vhost backend with guest memory
+        dev.attach_vhost(guest_memory)?;
+
+        // Re-program vrings for each ready queue
+        let queues = [&dev.rx_queue, &dev.tx_queue, &dev.event_queue];
+        for (idx, q) in queues.iter().enumerate() {
+            if !q.ready {
+                continue;
+            }
+            let kick_fd = dev.kick_eventfds[idx]
+                .ok_or_else(|| Error::Device("no kick eventfd on restore".into()))?;
+            let call_fd = dev._call_eventfds[idx]
+                .ok_or_else(|| Error::Device("no call eventfd on restore".into()))?;
+            let result = dev.set_vring(
+                idx as u32,
+                q.num as u32,
+                q.desc_addr,
+                q.driver_addr,
+                q.device_addr,
+                guest_memory,
+                kick_fd,
+                call_fd,
+            );
+            if let Err(e) = result {
+                if idx == 2 {
+                    debug!("virtio-vsock restore: ignoring event queue setup: {}", e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Resume vhost-vsock if the device was in DRIVER_OK state
+        if (dev.status & 4) != 0 {
+            dev.set_vhost_running(true)?;
+        }
+
+        debug!("Restored virtio-vsock MMIO (CID {})", cid);
+        Ok(dev)
     }
 }
 

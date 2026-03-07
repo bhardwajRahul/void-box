@@ -59,6 +59,10 @@ pub struct SandboxSpec {
     /// Set to "" to disable auto-pull.
     #[serde(default)]
     pub guest_image: Option<String>,
+    /// Path or hash-prefix of a snapshot to restore from.
+    /// If not set, the sandbox cold-boots normally.
+    #[serde(default)]
+    pub snapshot: Option<String>,
 }
 
 /// Specification for a host directory mount into the guest VM.
@@ -135,6 +139,26 @@ pub struct BoxSandboxOverride {
     /// Additional host directory mounts for this box.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Path or hash-prefix of a snapshot to restore from (per-box override).
+    #[serde(default)]
+    pub snapshot: Option<String>,
+}
+
+/// Warmup commands to run before agent execution.
+///
+/// When declared alongside a snapshot path, warmup runs after restore
+/// and the result is cached as a PostInit snapshot for subsequent runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupSpec {
+    /// Shell commands to execute sequentially (each via `sh -c`).
+    pub commands: Vec<String>,
+    /// Per-command timeout in seconds (default: 120).
+    #[serde(default = "default_warmup_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_warmup_timeout() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +179,9 @@ pub struct PipelineBoxSpec {
     /// Named inputs this stage consumes (host directories mounted ro).
     #[serde(default)]
     pub inputs: Vec<PipelineInputSpec>,
+    /// Warmup commands to run before agent execution (for PostInit snapshots).
+    #[serde(default)]
+    pub warmup: Option<WarmupSpec>,
 }
 
 /// A named output directory that a pipeline stage writes to.
@@ -265,6 +292,7 @@ impl Default for SandboxSpec {
             mounts: Vec::new(),
             image: None,
             guest_image: None,
+            snapshot: None,
         }
     }
 }

@@ -67,6 +67,8 @@ pub struct SandboxConfig {
     pub oci_rootfs_disk: Option<PathBuf>,
     /// Environment variables
     pub env: Vec<(String, String)>,
+    /// Path to a snapshot directory to restore from (skips cold boot).
+    pub snapshot: Option<PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -86,6 +88,7 @@ impl Default for SandboxConfig {
             oci_rootfs_dev: None,
             oci_rootfs_disk: None,
             env: Vec::new(),
+            snapshot: None,
         }
     }
 }
@@ -673,6 +676,12 @@ impl SandboxBuilder {
     /// Set the host OCI rootfs disk image path for virtio-blk.
     pub fn oci_rootfs_disk(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.oci_rootfs_disk = Some(path.into());
+        self
+    }
+
+    /// Set the snapshot directory to restore from (skips cold boot).
+    pub fn snapshot(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.snapshot = Some(path.into());
         self
     }
 

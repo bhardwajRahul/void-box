@@ -1928,6 +1928,12 @@ fn handle_connection(fd: RawFd) -> Result<(), String> {
                 let response = handle_mkdir_p(&request);
                 send_response(fd, MessageType::MkdirPResponse, &response)?;
             }
+            17 => {
+                // SnapshotReady - no-op acknowledgement from guest side.
+                // The host sends this to query readiness; the guest simply
+                // replies with SnapshotReady to confirm it is ready.
+                send_raw_message(fd, MessageType::SnapshotReady, &[])?;
+            }
             _ => {
                 eprintln!("Unknown message type: {}", msg_type);
             }

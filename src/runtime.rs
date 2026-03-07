@@ -508,7 +508,7 @@ fn build_pipeline_box_with_io(
 ) -> Result<VoidBox> {
     let mut builder = VoidBox::new(&b.name).prompt(&b.prompt);
     builder = apply_box_sandbox(builder, spec, guest);
-    builder = apply_box_overrides(builder, b.sandbox.as_ref());
+    builder = apply_box_overrides(builder, b.sandbox.as_ref(), spec);
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
     for s in &b.skills {
         builder = builder.skill(parse_skill_entry(s)?);
@@ -569,6 +569,11 @@ fn build_pipeline_box_with_io(
         builder = apply_oci_rootfs(builder, plan);
     }
 
+    // Wire warmup commands (explicit opt-in only)
+    if let Some(ref warmup) = b.warmup {
+        builder = builder.warmup(warmup.clone());
+    }
+
     builder.build()
 }
 
@@ -605,6 +610,11 @@ fn build_shared_sandbox(
     // OCI rootfs mount + pivot_root flag
     if let Some(plan) = oci_rootfs_plan {
         builder = apply_oci_rootfs_sandbox(builder, plan);
+    }
+
+    // Snapshot restore (explicit opt-in only)
+    if let Some(snap_dir) = resolve_snapshot(spec) {
+        builder = builder.snapshot(snap_dir);
     }
 
     if mode == "local" && guest.is_none() {
@@ -647,6 +657,11 @@ fn apply_box_sandbox(mut builder: VoidBox, spec: &RunSpec, guest: Option<&GuestF
 
     for m in &spec.sandbox.mounts {
         builder = builder.mount(mount_spec_to_config(m));
+    }
+
+    // Snapshot restore (explicit opt-in only)
+    if let Some(snap_dir) = resolve_snapshot(spec) {
+        builder = builder.snapshot(snap_dir);
     }
 
     if mode == "auto" && guest.is_none() {
@@ -746,6 +761,77 @@ async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
     })
 }
 
+/// Resolve the snapshot path from the spec.
+///
+/// Returns `Some(path)` only if the spec explicitly declares a snapshot.
+/// No auto-detection, no env var fallback — snapshots are off unless
+/// the user explicitly sets `sandbox.snapshot` in the spec.
+#[cfg(target_os = "linux")]
+fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
+    let hash = spec.sandbox.snapshot.as_deref()?;
+    if hash.is_empty() {
+        return None;
+    }
+    // Resolve hash prefix to a snapshot directory
+    let dir = crate::vmm::snapshot::snapshot_dir_for_hash(hash);
+    if dir.join("state.bin").exists() {
+        Some(dir)
+    } else {
+        // Treat as a literal path
+        let path = PathBuf::from(hash);
+        if path.join("state.bin").exists() {
+            Some(path)
+        } else {
+            eprintln!(
+                "[void-box] Snapshot '{}' not found (checked {} and literal path)",
+                hash,
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_snapshot(_spec: &RunSpec) -> Option<PathBuf> {
+    None
+}
+
+/// Resolve per-box snapshot override, falling back to the top-level spec.
+#[cfg(target_os = "linux")]
+fn resolve_box_snapshot(
+    box_override: Option<&BoxSandboxOverride>,
+    spec: &RunSpec,
+) -> Option<PathBuf> {
+    // Per-box override takes priority
+    if let Some(ov) = box_override {
+        if let Some(ref hash) = ov.snapshot {
+            if !hash.is_empty() {
+                let dir = crate::vmm::snapshot::snapshot_dir_for_hash(hash);
+                if dir.join("state.bin").exists() {
+                    return Some(dir);
+                }
+                let path = PathBuf::from(hash);
+                if path.join("state.bin").exists() {
+                    return Some(path);
+                }
+                eprintln!("[void-box] Per-box snapshot '{}' not found", hash);
+                return None;
+            }
+        }
+    }
+    // Fall back to top-level spec
+    resolve_snapshot(spec)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_box_snapshot(
+    _box_override: Option<&BoxSandboxOverride>,
+    _spec: &RunSpec,
+) -> Option<PathBuf> {
+    None
+}
+
 fn resolve_kernel_local(spec: &RunSpec) -> Option<PathBuf> {
     spec.sandbox
         .kernel
@@ -765,7 +851,11 @@ fn resolve_initramfs_local(spec: &RunSpec) -> Option<PathBuf> {
 }
 
 /// Apply per-box sandbox overrides on top of the base sandbox config.
-fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverride>) -> VoidBox {
+fn apply_box_overrides(
+    mut builder: VoidBox,
+    overrides: Option<&BoxSandboxOverride>,
+    spec: &RunSpec,
+) -> VoidBox {
     let Some(ov) = overrides else {
         return builder;
     };
@@ -783,6 +873,10 @@ fn apply_box_overrides(mut builder: VoidBox, overrides: Option<&BoxSandboxOverri
     }
     for m in &ov.mounts {
         builder = builder.mount(mount_spec_to_config(m));
+    }
+    // Per-box snapshot override (explicit opt-in only)
+    if let Some(snap_dir) = resolve_box_snapshot(Some(ov), spec) {
+        builder = builder.snapshot(snap_dir);
     }
     builder
 }
@@ -841,7 +935,7 @@ fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
     builder.llm(provider)
 }
 
-fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
+pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
     let provider = std::env::var("VOIDBOX_LLM_PROVIDER").ok();
     let model = std::env::var("VOIDBOX_LLM_MODEL").ok();
     let base_url = std::env::var("VOIDBOX_LLM_BASE_URL").ok();
