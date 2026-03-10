@@ -10,7 +10,7 @@
 #   - Omitted → normal cold boot
 #
 # To create snapshots (optional, for faster restores):
-#   cargo run --example snapshot_restore
+#   voidbox snapshot create
 #
 # Run:
 #   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \

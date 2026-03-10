@@ -1,4 +1,12 @@
-//! Snapshot / Restore Demo
+//! Snapshot / Restore Demo (Developer API)
+//!
+//! **Note:** This is a developer API demo showing programmatic snapshot
+//! workflows. For normal usage, prefer the CLI:
+//! ```bash
+//! voidbox snapshot create   # create a snapshot
+//! voidbox snapshot list     # list existing snapshots
+//! voidbox snapshot delete   # delete a snapshot
+//! ```
 //!
 //! Shows the three snapshot workflows:
 //! 1. **Base snapshot** — cold boot a VM, take a full snapshot, restore it

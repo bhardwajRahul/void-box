@@ -5,10 +5,10 @@
 #   - A hash prefix (e.g. "60e3c527") → resolves to ~/.void-box/snapshots/<prefix>/
 #   - A literal directory path containing state.bin + memory.mem
 #
-# To create a snapshot first, use the Rust API:
-#   cargo run --example snapshot_restore
+# To create a snapshot first:
+#   voidbox snapshot create
 #
-# Then find the hash prefix in ~/.void-box/snapshots/ and set it below.
+# Then find the hash prefix with `voidbox snapshot list` and set it below.
 #
 # Run:
 #   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \

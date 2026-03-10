@@ -830,3 +830,178 @@ async fn snapshot_net_restore() {
 
     restored_vm.stop().await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// Tests: Snapshot CLI library functions (create/list/delete)
+// ---------------------------------------------------------------------------
+
+/// Verify `list_snapshots()` returns an empty vec when no snapshots exist.
+///
+/// Uses a temporary HOME to avoid reading real user snapshots.
+#[test]
+fn snapshot_cli_list_empty() {
+    let tmp_home = tempfile::tempdir().expect("tempdir");
+    // Temporarily override HOME so dirs_snapshot_base() points to our temp dir
+    let orig_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", tmp_home.path());
+
+    let result = snapshot::list_snapshots();
+    assert!(result.is_ok(), "list_snapshots must not error");
+    assert!(result.unwrap().is_empty(), "no snapshots should exist");
+
+    // Restore original HOME
+    match orig_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+}
+
+/// Boot a VM, take a snapshot into the standard location, then verify
+/// `list_snapshots()` includes it with correct metadata.
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_cli_create_and_list() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config(&kernel, initramfs.as_deref());
+
+    // --- Cold boot ---
+    eprintln!("[cli_create_list] Booting VM...");
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+
+    // --- Snapshot into the standard directory ---
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+    let snap_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
+
+    eprintln!(
+        "[cli_create_list] Taking snapshot (hash={})...",
+        &config_hash[..16]
+    );
+    match vm
+        .snapshot(&snap_dir, config_hash.clone(), snap_config())
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&snap_dir);
+            return;
+        }
+    }
+
+    // --- Verify list_snapshots() finds it ---
+    let snapshots = snapshot::list_snapshots().expect("list_snapshots");
+    let found = snapshots.iter().find(|s| s.config_hash == config_hash);
+    assert!(
+        found.is_some(),
+        "list_snapshots must include the snapshot we just created"
+    );
+
+    let info = found.unwrap();
+    assert_eq!(info.memory_mb, 256);
+    assert_eq!(info.vcpus, 1);
+    assert_eq!(info.snapshot_type, snapshot::SnapshotType::Base);
+    assert!(
+        info.memory_file_size > 0,
+        "memory file must have non-zero size"
+    );
+    eprintln!(
+        "[cli_create_list] Found snapshot: hash={}, memory={}MB, vcpus={}",
+        &info.config_hash[..16],
+        info.memory_mb,
+        info.vcpus
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&snap_dir);
+}
+
+/// Create a snapshot, delete it via `delete_snapshot()`, and verify it is gone.
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_cli_delete() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config(&kernel, initramfs.as_deref());
+
+    // --- Cold boot ---
+    eprintln!("[cli_delete] Booting VM...");
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+
+    // --- Snapshot ---
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+    let snap_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
+
+    eprintln!("[cli_delete] Taking snapshot...");
+    match vm
+        .snapshot(&snap_dir, config_hash.clone(), snap_config())
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&snap_dir);
+            return;
+        }
+    }
+
+    // Verify it exists
+    assert!(snap_dir.exists(), "snapshot dir must exist before delete");
+    let snapshots = snapshot::list_snapshots().expect("list before delete");
+    assert!(
+        snapshots.iter().any(|s| s.config_hash == config_hash),
+        "snapshot must be listed before delete"
+    );
+
+    // --- Delete ---
+    let hash_prefix = &config_hash[..8];
+    eprintln!("[cli_delete] Deleting snapshot (prefix={})...", hash_prefix);
+    let deleted = snapshot::delete_snapshot(hash_prefix).expect("delete_snapshot");
+    assert!(deleted, "delete_snapshot must return true");
+
+    // Verify it is gone
+    assert!(
+        !snap_dir.exists(),
+        "snapshot dir must be removed after delete"
+    );
+    let snapshots_after = snapshot::list_snapshots().expect("list after delete");
+    assert!(
+        !snapshots_after.iter().any(|s| s.config_hash == config_hash),
+        "snapshot must not be listed after delete"
+    );
+    eprintln!("[cli_delete] Snapshot deleted and verified gone");
+}

@@ -171,7 +171,7 @@ voidbox run --file hackernews_agent.yaml
 │  │  SLIRP ←→ eth0 (10.0.2.15)                      │  │
 │  │  Linux/KVM: virtio-blk ←→ OCI base rootfs       │  │
 │  │  9p/virtiofs ←→ skills + host mounts            │  │
-│  │  Snapshot: base/diff/live → ~/.void-box/snapshots│  │
+│  │  Snapshot: base/diff → ~/.void-box/snapshots    │  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                       │
 │  Seccomp-BPF │ OTLP export                            │
