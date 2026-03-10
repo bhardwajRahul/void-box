@@ -102,20 +102,27 @@ impl VirtioVsockUserspace {
 
         let conn_map = VsockConnectionMap::new(cid as u64, &socket_path)?;
 
-        // Create eventfds for kick and call
+        // Create all EventFds first (RAII protects against partial failure)
+        let mut kick_fds = Vec::with_capacity(3);
+        let mut call_fds = Vec::with_capacity(3);
+        for _ in 0..3 {
+            kick_fds.push(
+                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                    .map_err(|e| Error::Device(format!("eventfd: {}", e)))?,
+            );
+            call_fds.push(
+                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                    .map_err(|e| Error::Device(format!("eventfd: {}", e)))?,
+            );
+        }
+
+        // All allocations succeeded — extract raw fds (mem::forget transfers ownership)
         let mut kick = [None, None, None];
         let mut call = [None, None, None];
-        for i in 0..3 {
-            let k =
-                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                    .map_err(|e| Error::Device(format!("eventfd: {}", e)))?;
+        for (i, (k, c)) in kick_fds.into_iter().zip(call_fds).enumerate() {
             let kfd = k.as_raw_fd();
             std::mem::forget(k);
             kick[i] = Some(kfd);
-
-            let c =
-                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                    .map_err(|e| Error::Device(format!("eventfd: {}", e)))?;
             let cfd = c.as_raw_fd();
             std::mem::forget(c);
             call[i] = Some(cfd);
@@ -334,25 +341,36 @@ impl VirtioVsockUserspace {
                 }
             };
 
-            // Write header + data into the descriptor chain
+            // Write header + data scattered across writable descriptors
             let hdr_bytes = hdr.to_bytes();
-            let total_len = VSOCK_HEADER_SIZE + data.len();
+            let mut write_buf: Vec<u8> = Vec::with_capacity(VSOCK_HEADER_SIZE + data.len());
+            write_buf.extend_from_slice(&hdr_bytes);
+            write_buf.extend_from_slice(&data);
 
-            // Find a writable descriptor
+            let mut bytes_written = 0u32;
+            let mut buf_offset = 0usize;
+
             for desc in &chain.descriptors {
-                if desc.flags & VRING_DESC_F_WRITE != 0 {
-                    // Write header
-                    let _ = mem.write(&hdr_bytes, GuestAddress(desc.addr));
-                    // Write data after header
-                    if !data.is_empty() && desc.len as usize >= VSOCK_HEADER_SIZE + data.len() {
-                        let _ =
-                            mem.write(&data, GuestAddress(desc.addr + VSOCK_HEADER_SIZE as u64));
-                    }
+                if desc.flags & VRING_DESC_F_WRITE == 0 {
+                    continue;
+                }
+                let available = desc.len as usize;
+                let remaining = write_buf.len() - buf_offset;
+                let to_write = remaining.min(available);
+                if to_write > 0 {
+                    let _ = mem.write(
+                        &write_buf[buf_offset..buf_offset + to_write],
+                        GuestAddress(desc.addr),
+                    );
+                    buf_offset += to_write;
+                    bytes_written += to_write as u32;
+                }
+                if buf_offset >= write_buf.len() {
                     break;
                 }
             }
 
-            rx_queue.push_used(mem, chain.head_index, total_len as u32);
+            rx_queue.push_used(mem, chain.head_index, bytes_written);
             injected += 1;
         }
 
@@ -792,7 +810,19 @@ impl Drop for VirtioVsockUserspace {
     fn drop(&mut self) {
         self.worker_running.store(false, Ordering::SeqCst);
 
-        // Close eventfds
+        // Wake the worker from epoll_wait by writing to a kick eventfd
+        if let Some(Some(fd)) = self.kick_eventfds.first() {
+            unsafe {
+                libc::eventfd_write(*fd, 1);
+            }
+        }
+
+        // Join worker thread before closing fds
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+
+        // Now safe to close eventfds
         for fd in self.kick_eventfds.iter().flatten() {
             unsafe {
                 libc::close(*fd);

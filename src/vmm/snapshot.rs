@@ -17,7 +17,7 @@ use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::{Error, Result};
 
 /// Snapshot format version for forward compatibility.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Default snapshot storage directory.
 pub fn default_snapshot_dir() -> PathBuf {

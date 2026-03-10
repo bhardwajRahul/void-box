@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -227,6 +228,18 @@ impl VsockConnectionMap {
                 e
             ))
         })?;
+
+        // Restrict socket permissions to owner-only
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                crate::Error::Device(format!(
+                    "chmod vsock socket {}: {}",
+                    socket_path.display(),
+                    e
+                ))
+            },
+        )?;
+
         listener.set_nonblocking(true).map_err(|e| {
             crate::Error::Device(format!("set_nonblocking on vsock listener: {}", e))
         })?;
@@ -558,20 +571,27 @@ impl VsockConnectionMap {
     }
 
     fn next_ephemeral_port(&self) -> u32 {
-        // Start from 49152 (dynamic port range) and find an unused one
-        let mut port = 49152u32;
+        let start = 49152u32;
+        let end = 65535u32;
+        let range_size = end - start + 1;
+        let mut port = start;
+        let mut checked = 0u32;
+
         loop {
             let in_use = self.connections.values().any(|c| c.host_port == port);
             if !in_use {
                 return port;
             }
+            checked += 1;
+            if checked >= range_size {
+                // All ports exhausted — return start as fallback
+                return start;
+            }
             port += 1;
-            if port > 65535 {
-                port = 49152;
-                break;
+            if port > end {
+                port = start;
             }
         }
-        port
     }
 
     /// Get the listener's raw fd for epoll.

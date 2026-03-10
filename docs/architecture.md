@@ -370,7 +370,7 @@ Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
 ```
 ~/.void-box/snapshots/
   └── <hash-prefix>/        # first 16 chars of config hash
-      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, vsock, config)
+      ├── state.bin          # bincode: VmSnapshot (vCPU regs, irqchip, PIT, vsock, config)
       ├── memory.mem         # full memory dump (base)
       └── memory.diff        # dirty pages only (diff snapshots)
 ```
@@ -378,7 +378,7 @@ Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
 ### Restore flow
 
 ```
-1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, vsock, config)
+1. VmSnapshot::load(dir)           Read state.bin (vCPU, irqchip, PIT, vsock, config)
 2. Vm::new(memory_mb)              Create KVM VM with matching memory size
 3. restore_memory(mem, path)       COW mmap(MAP_PRIVATE|MAP_FIXED) — lazy page loading
 4. vm.restore_irqchip(state)       Restore PIC master/slave + IOAPIC
