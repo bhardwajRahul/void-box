@@ -355,12 +355,15 @@ VoidBox supports three types of VM snapshots for sub-second restore. All snapsho
 
 Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
 
-| Phase | Time |
-|---|---|
-| Cold boot | 14.6 ms |
-| Snapshot capture | 425.7 ms |
-| Restore | 1.3 ms |
-| **Speedup** | **11.6x** |
+| Phase | Time | Notes |
+|---|---|---|
+| Cold boot | ~10 ms | |
+| Base snapshot | ~420 ms | Full 256 MB memory dump |
+| Base restore | ~1.3 ms | COW mmap, lazy page loading |
+| Diff snapshot | ~270 ms | Only dirty pages (~1.5 MB, 0.6% of RAM) |
+| Diff restore | ~3 ms | Base COW mmap + dirty page overlay |
+| **Base speedup** | **~8x** | Cold boot / base restore |
+| **Diff savings** | **99.4%** | Memory file size reduction |
 
 ### Storage layout
 

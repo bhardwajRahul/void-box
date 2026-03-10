@@ -523,6 +523,11 @@ impl MicroVm {
         //    processing, causing spinlock deadlocks on single-vCPU VMs.
         vm.restore_irqchip(&snap.irqchip)?;
 
+        // 3b. Restore KVM clock (TSC synchronization for SMP)
+        if !snap.clock.is_empty() {
+            vm.restore_clock(&snap.clock)?;
+        }
+
         // 4. Serial device (fresh — no state to restore)
         let (serial_tx, serial_rx) = mpsc::channel(4096);
         let serial = SerialDevice::new(serial_tx);
@@ -812,6 +817,7 @@ impl MicroVm {
         // 4. Capture VM-level state (vm_fd is still valid)
         let irqchip = self.vm.capture_irqchip()?;
         let pit = self.vm.capture_pit()?;
+        let clock = self.vm.capture_clock()?;
 
         // 5. Capture vsock device state
         let vsock_state = if let Some(ref vsock_mmio) = self.virtio_vsock_mmio {
@@ -880,6 +886,7 @@ impl MicroVm {
                 snapshot::SnapshotType::Base
             },
             session_secret,
+            clock,
         };
         snap.save(snapshot_dir)?;
 

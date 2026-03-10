@@ -264,6 +264,23 @@ impl Vm {
         Ok(())
     }
 
+    /// Capture KVM clock state for snapshot.
+    pub fn capture_clock(&self) -> Result<Vec<u8>> {
+        let clock = self.vm_fd.get_clock().map_err(Error::Kvm)?;
+        let bytes = kvm_struct_to_bytes(&clock);
+        debug!("Captured KVM clock ({} bytes)", bytes.len());
+        Ok(bytes)
+    }
+
+    /// Restore KVM clock state from a snapshot.
+    pub fn restore_clock(&self, data: &[u8]) -> Result<()> {
+        use kvm_bindings::kvm_clock_data;
+        let clock: kvm_clock_data = kvm_struct_from_bytes(data)?;
+        self.vm_fd.set_clock(&clock).map_err(Error::Kvm)?;
+        debug!("Restored KVM clock");
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Snapshot: dirty page tracking
     // ------------------------------------------------------------------

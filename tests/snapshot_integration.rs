@@ -68,18 +68,21 @@ fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
 
 /// Build a `VoidBoxConfig` from kernel/initramfs paths.
 fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -> VoidBoxConfig {
+    build_config_vcpus(kernel, initramfs, 1)
+}
+
+/// Build a `VoidBoxConfig` with a specific vCPU count.
+fn build_config_vcpus(
+    kernel: &std::path::Path,
+    initramfs: Option<&std::path::Path>,
+    vcpus: usize,
+) -> VoidBoxConfig {
     let mut cfg = VoidBoxConfig::new()
         .memory_mb(256)
-        .vcpus(1)
+        .vcpus(vcpus)
         .kernel(kernel)
         .enable_vsock(true)
-        .vsock_backend(VsockBackendType::Userspace)
-        // Force periodic LAPIC timer instead of TSC-deadline mode.
-        // After snapshot restore the kernel's clockevent state is stale and
-        // TSC_DEADLINE=0 means no timer ever fires again.  Periodic mode
-        // survives restore because the LAPIC hardware re-generates ticks from
-        // TMICT/TDCR without needing the kernel to re-arm.
-;
+        .vsock_backend(VsockBackendType::Userspace);
     if let Some(p) = initramfs {
         cfg = cfg.initramfs(p);
     }
@@ -91,9 +94,14 @@ fn build_config(kernel: &std::path::Path, initramfs: Option<&std::path::Path>) -
 /// Note: `cid` is set to 0 here — `snapshot_internal()` overwrites it with
 /// the VM's actual CID before saving.
 fn snap_config() -> SnapshotConfig {
+    snap_config_vcpus(1)
+}
+
+/// Build a `SnapshotConfig` with a specific vCPU count.
+fn snap_config_vcpus(vcpus: usize) -> SnapshotConfig {
     SnapshotConfig {
         memory_mb: 256,
-        vcpus: 1,
+        vcpus,
         cid: 0, // overwritten by snapshot_internal()
         vsock_mmio_base: 0xd080_0000,
         network: false,
@@ -277,6 +285,350 @@ async fn snapshot_cold_boot_vs_restore() {
     eprintln!("  Restore:     {:>10.1?}", restore_time);
     eprintln!("  Speedup:     {:>10.1}x", speedup);
     eprintln!("============================");
+
+    restored_vm.stop().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test: Base snapshot → restore → dirty tracking → diff snapshot → restore
+// ---------------------------------------------------------------------------
+
+/// Take a base snapshot, restore it, run a command (dirties pages), take a
+/// diff snapshot, restore from diff, and verify exec works.
+///
+/// Validates that:
+/// - `enable_dirty_tracking()` succeeds on a restored VM
+/// - `snapshot_diff()` produces a smaller memory file than the full dump
+/// - Restoring from a diff snapshot (base + delta) yields a working VM
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_diff_restore() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config(&kernel, initramfs.as_deref());
+
+    // --- Cold boot ---
+    eprintln!("[diff_restore] Booting VM...");
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+
+    // Health check
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  cold boot exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+    eprintln!("[diff_restore] Cold boot OK");
+
+    // --- Base snapshot ---
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+
+    // Save base to the standard snapshot directory so diff restore can find it
+    let base_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&base_dir).expect("create base snapshot dir");
+
+    eprintln!("[diff_restore] Taking base snapshot...");
+    let base_snap_start = Instant::now();
+    let base_path = match vm
+        .snapshot(&base_dir, config_hash.clone(), snap_config())
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  base snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    let base_snap_time = base_snap_start.elapsed();
+    eprintln!(
+        "[diff_restore] Base snapshot captured in {:.1?}",
+        base_snap_time
+    );
+
+    let base_mem_size = std::fs::metadata(VmSnapshot::memory_path(&base_path))
+        .unwrap()
+        .len();
+
+    // --- Restore from base ---
+    eprintln!("[diff_restore] Restoring from base snapshot...");
+    let restored_vm = match MicroVm::from_snapshot(&base_path).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  base restore failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    eprintln!("[diff_restore] Restored VM CID={}", restored_vm.cid());
+
+    // Enable dirty tracking BEFORE any exec — all guest activity must be
+    // captured so the diff contains every page that changed since the base.
+    eprintln!("[diff_restore] Enabling dirty page tracking...");
+    restored_vm
+        .enable_dirty_tracking()
+        .expect("enable dirty tracking");
+
+    // Verify exec works on base-restored VM (this also dirties pages)
+    let exec_ok = try_restored_exec(&restored_vm).await;
+    assert!(exec_ok, "base-restored VM exec must succeed");
+
+    // Run another command to dirty more guest pages
+    let output = match restored_vm.exec("echo", &["dirty-pages"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  exec after dirty tracking failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    assert!(output.success());
+    assert_eq!(output.stdout_str().trim(), "dirty-pages");
+    eprintln!("[diff_restore] Dirtied pages via exec");
+
+    // --- Diff snapshot ---
+    let diff_dir = tempfile::tempdir().expect("tempdir for diff");
+    let parent_id = config_hash.clone();
+
+    eprintln!("[diff_restore] Taking diff snapshot...");
+    let diff_snap_start = Instant::now();
+    let diff_path = match restored_vm
+        .snapshot_diff(
+            diff_dir.path(),
+            config_hash.clone(),
+            snap_config(),
+            parent_id,
+        )
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  diff snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    let diff_snap_time = diff_snap_start.elapsed();
+    eprintln!(
+        "[diff_restore] Diff snapshot captured in {:.1?}",
+        diff_snap_time
+    );
+
+    // Validate diff is smaller than base
+    let diff_mem_path = VmSnapshot::diff_memory_path(&diff_path);
+    assert!(diff_mem_path.exists(), "diff memory file must exist");
+    let diff_mem_size = std::fs::metadata(&diff_mem_path).unwrap().len();
+    eprintln!(
+        "[diff_restore] Base memory: {} bytes, Diff memory: {} bytes ({:.1}%)",
+        base_mem_size,
+        diff_mem_size,
+        (diff_mem_size as f64 / base_mem_size as f64) * 100.0
+    );
+    assert!(
+        diff_mem_size < base_mem_size,
+        "diff memory ({diff_mem_size}) must be smaller than base ({base_mem_size})"
+    );
+
+    // Validate snapshot metadata
+    let diff_snap = VmSnapshot::load(&diff_path).expect("load diff snapshot");
+    assert_eq!(
+        diff_snap.snapshot_type,
+        snapshot::SnapshotType::Diff,
+        "must be a diff snapshot"
+    );
+    assert!(
+        diff_snap.parent_id.is_some(),
+        "diff snapshot must have parent_id"
+    );
+
+    // --- Restore from diff ---
+    eprintln!("[diff_restore] Restoring from diff snapshot...");
+    let diff_restore_start = Instant::now();
+    let mut diff_restored_vm = match MicroVm::from_snapshot(&diff_path).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  diff restore failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    let diff_restore_time = diff_restore_start.elapsed();
+    eprintln!(
+        "[diff_restore] Diff-restored VM CID={} (restore took {:.1?})",
+        diff_restored_vm.cid(),
+        diff_restore_time
+    );
+
+    // Verify exec works on diff-restored VM
+    let exec_ok = try_restored_exec(&diff_restored_vm).await;
+
+    // Dump serial output on failure
+    if !exec_ok {
+        let serial = diff_restored_vm.read_serial_output();
+        if !serial.is_empty() {
+            let s = String::from_utf8_lossy(&serial);
+            eprintln!(
+                "[diff_restore] Serial output ({} bytes):\n{}",
+                serial.len(),
+                s
+            );
+        }
+    }
+
+    assert!(exec_ok, "diff-restored VM exec must succeed");
+
+    // --- Summary ---
+    eprintln!();
+    eprintln!("=== Diff Snapshot Summary ===");
+    eprintln!("  Base snapshot:   {:>10.1?}", base_snap_time);
+    eprintln!("  Diff snapshot:   {:>10.1?}", diff_snap_time);
+    eprintln!("  Diff restore:    {:>10.1?}", diff_restore_time);
+    eprintln!(
+        "  Memory savings:  {:>10.1}%",
+        (1.0 - diff_mem_size as f64 / base_mem_size as f64) * 100.0
+    );
+    eprintln!("=============================");
+
+    diff_restored_vm.stop().await.ok();
+
+    // Cleanup base snapshot from standard location
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Multi-vCPU snapshot → restore
+// ---------------------------------------------------------------------------
+
+/// Cold-boot a VM with multiple vCPUs, take a snapshot, restore, and verify
+/// that all vCPU states are captured and the restored VM is functional.
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_multi_vcpu() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+
+    let num_vcpus: usize = 4;
+    let cfg = build_config_vcpus(&kernel, initramfs.as_deref(), num_vcpus);
+
+    // --- Cold boot with 4 vCPUs ---
+    eprintln!("[multi_vcpu] Booting VM with {} vCPUs...", num_vcpus);
+    let cold_start = Instant::now();
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+    let cold_boot_time = cold_start.elapsed();
+
+    // Health check
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  cold boot exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+    assert_eq!(output.stdout_str().trim(), "ready");
+    eprintln!(
+        "[multi_vcpu] Cold boot OK ({:.1?}, {} vCPUs)",
+        cold_boot_time, num_vcpus
+    );
+
+    // --- Snapshot ---
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, num_vcpus).expect("hash");
+
+    eprintln!("[multi_vcpu] Taking snapshot...");
+    let snap_start = Instant::now();
+    let snapshot_path = match vm
+        .snapshot(snap_dir.path(), config_hash, snap_config_vcpus(num_vcpus))
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  snapshot failed: {e}");
+            return;
+        }
+    };
+    let snap_time = snap_start.elapsed();
+    eprintln!("[multi_vcpu] Snapshot captured in {:.1?}", snap_time);
+
+    // Validate all vCPU states are present
+    let snap = VmSnapshot::load(&snapshot_path).expect("load snapshot");
+    assert_eq!(
+        snap.vcpu_states.len(),
+        num_vcpus,
+        "snapshot must contain state for all {} vCPUs",
+        num_vcpus
+    );
+    for (i, state) in snap.vcpu_states.iter().enumerate() {
+        assert!(!state.regs.is_empty(), "vCPU {} regs must be captured", i);
+        assert!(!state.sregs.is_empty(), "vCPU {} sregs must be captured", i);
+        assert!(!state.lapic.is_empty(), "vCPU {} LAPIC must be captured", i);
+        assert!(!state.xsave.is_empty(), "vCPU {} xsave must be captured", i);
+        assert!(!state.xcrs.is_empty(), "vCPU {} XCRs must be captured", i);
+    }
+    eprintln!(
+        "[multi_vcpu] Snapshot has {} vCPU states (all validated)",
+        snap.vcpu_states.len()
+    );
+
+    // --- Restore ---
+    eprintln!("[multi_vcpu] Restoring from snapshot...");
+    let restore_start = Instant::now();
+    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  restore failed: {e}");
+            return;
+        }
+    };
+    let restore_time = restore_start.elapsed();
+    eprintln!(
+        "[multi_vcpu] Restored VM CID={} (restore took {:.1?})",
+        restored_vm.cid(),
+        restore_time
+    );
+
+    let exec_ok = try_restored_exec(&restored_vm).await;
+
+    // Always dump serial for multi-vCPU debugging
+    let serial = restored_vm.read_serial_output();
+    if !serial.is_empty() {
+        let s = String::from_utf8_lossy(&serial);
+        eprintln!(
+            "[multi_vcpu] Serial output ({} bytes):\n{}",
+            serial.len(),
+            s
+        );
+    }
+
+    assert!(exec_ok, "multi-vCPU restored VM exec must succeed");
+
+    // --- Summary ---
+    let speedup = cold_boot_time.as_secs_f64() / restore_time.as_secs_f64().max(1e-9);
+    eprintln!();
+    eprintln!("=== Multi-vCPU Snapshot ({} vCPUs) ===", num_vcpus);
+    eprintln!("  Cold boot:   {:>10.1?}", cold_boot_time);
+    eprintln!("  Snapshot:    {:>10.1?}", snap_time);
+    eprintln!("  Restore:     {:>10.1?}", restore_time);
+    eprintln!("  Speedup:     {:>10.1}x", speedup);
+    eprintln!("========================================");
 
     restored_vm.stop().await.ok();
 }

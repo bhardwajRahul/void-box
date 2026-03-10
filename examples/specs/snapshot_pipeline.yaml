@@ -1,0 +1,57 @@
+# Snapshot Pipeline Example
+#
+# A two-stage pipeline where one or both boxes restore from snapshots
+# instead of cold-booting. Each box can override the snapshot setting
+# independently via `sandbox.snapshot`.
+#
+# The snapshot path can be:
+#   - A hash prefix (e.g. "60e3c527") → ~/.void-box/snapshots/<prefix>/
+#   - A literal directory path containing state.bin + memory.mem
+#   - Omitted → normal cold boot
+#
+# To create snapshots, use:
+#   cargo run --example snapshot_restore
+#
+# Run:
+#   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+#   cargo run --bin voidbox -- run --file examples/specs/snapshot_pipeline.yaml
+
+api_version: v1
+kind: pipeline
+name: snapshot-pipeline
+
+sandbox:
+  mode: auto
+  memory_mb: 256
+  vcpus: 1
+  network: false
+  # Top-level snapshot: all boxes restore from this snapshot by default.
+  # Per-box overrides below take priority.
+  # snapshot: "60e3c527"
+
+llm:
+  provider: claude
+
+pipeline:
+  boxes:
+    - name: analyzer
+      prompt: "List 3 key benefits of VM snapshot/restore for agent workloads."
+      skills:
+        - "agent:claude-code"
+      timeout_secs: 120
+      # Per-box snapshot override — this box restores from a snapshot.
+      # sandbox:
+      #   snapshot: "60e3c527"
+
+    - name: summarizer
+      prompt: "Summarize the input into one paragraph."
+      skills:
+        - "agent:claude-code"
+      timeout_secs: 120
+      # This box cold-boots (no snapshot override).
+
+  stages:
+    - type: box
+      name: analyzer
+    - type: box
+      name: summarizer

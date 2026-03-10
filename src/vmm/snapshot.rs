@@ -71,6 +71,11 @@ pub struct VcpuState {
     /// `kvm_xcrs` as raw bytes (XCR0 — controls which XSAVE features are active).
     #[serde(default)]
     pub xcrs: Vec<u8>,
+    /// `kvm_mp_state` as a u32 (MP state: RUNNABLE, HALTED, etc.).
+    /// Critical for SMP restore — without it, secondary vCPUs resume in
+    /// wrong state (RUNNABLE instead of HALTED) causing kernel deadlocks.
+    #[serde(default)]
+    pub mp_state: Option<u32>,
 }
 
 /// IRQ chip state (PIC master + PIC slave + IOAPIC) as raw bytes.
@@ -140,6 +145,11 @@ pub struct VmSnapshot {
     pub snapshot_type: SnapshotType,
     /// Session secret that the guest-agent expects (from kernel cmdline).
     pub session_secret: Vec<u8>,
+    /// KVM clock data (`kvm_clock_data` as raw bytes) for TSC synchronization.
+    /// Critical for SMP restore — without it, secondary CPUs may spin
+    /// forever waiting for time sync.
+    #[serde(default)]
+    pub clock: Vec<u8>,
 }
 
 impl VmSnapshot {
@@ -799,6 +809,7 @@ mod tests {
             msrs: vec![(0x10, 1000), (0xC0000080, 2000)],
             vcpu_events: vec![],
             xcrs: vec![],
+            mp_state: Some(0),
         };
         let bytes = bincode::serialize(&state).unwrap();
         let restored: VcpuState = bincode::deserialize(&bytes).unwrap();
@@ -851,6 +862,7 @@ mod tests {
                 msrs: vec![(0x10, 100)],
                 vcpu_events: vec![],
                 xcrs: vec![],
+                mp_state: Some(0),
             }],
             irqchip: IrqchipState {
                 pic_master: vec![0; 64],
@@ -887,6 +899,7 @@ mod tests {
             config_hash: "abc123".into(),
             snapshot_type: SnapshotType::Base,
             session_secret: vec![0xAA; 32],
+            clock: vec![],
         };
         let bytes = bincode::serialize(&snap).unwrap();
         let restored: VmSnapshot = bincode::deserialize(&bytes).unwrap();

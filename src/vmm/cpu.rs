@@ -76,6 +76,7 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
     let xsave = vcpu_fd.get_xsave().map_err(Error::Kvm)?;
     let vcpu_events = vcpu_fd.get_vcpu_events().map_err(Error::Kvm)?;
     let xcrs = vcpu_fd.get_xcrs().map_err(Error::Kvm)?;
+    let mp_state = vcpu_fd.get_mp_state().map_err(Error::Kvm)?;
 
     // Capture MSRs — read each individually so unsupported ones don't
     // prevent reading subsequent MSRs (get_msrs stops at first error).
@@ -107,6 +108,7 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
         msrs: msr_pairs,
         vcpu_events: kvm_struct_to_bytes(&vcpu_events),
         xcrs: kvm_struct_to_bytes(&xcrs),
+        mp_state: Some(mp_state.mp_state),
     })
 }
 
@@ -122,7 +124,11 @@ pub fn capture_vcpu_state(vcpu_fd: &VcpuFd) -> Result<VcpuState> {
 /// 5. vcpu_events (pending interrupt/exception delivery state)
 /// 6. xsave (FPU/SSE/AVX state)
 /// 7. regs last (general-purpose registers including RIP)
-pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
+///
+/// `vcpu_id` is used to decide LAPIC timer bootstrap: only the BSP (vCPU 0)
+/// gets timer bootstrap.  Secondary vCPUs are restored faithfully — the BSP
+/// will IPI them when the kernel needs them.
+pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState, vcpu_id: u64) -> Result<()> {
     use kvm_bindings::{
         kvm_lapic_state, kvm_msr_entry, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
     };
@@ -195,22 +201,38 @@ pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
             lapic.regs[lvt_timer_offset + 3] as u8,
         ]);
         let timer_masked = (lvt_timer >> 16) & 1;
+        let timer_mode = (lvt_timer >> 17) & 0x3; // 0=oneshot, 1=periodic, 2=TSC-deadline
         let timer_vector = lvt_timer & 0xFF;
 
-        if timer_masked == 1 && timer_vector == 0 {
-            // Guest was in NO_HZ idle — the timer is masked with vector 0.
-            // Reconfigure to periodic mode with LOCAL_TIMER_VECTOR (0xEC) and
-            // unmask it so the first tick bootstraps the scheduler.
+        // Read current TMICT (Timer Initial Count Register).
+        let tmict_offset = 0x380;
+        let current_tmict = u32::from_le_bytes([
+            lapic.regs[tmict_offset] as u8,
+            lapic.regs[tmict_offset + 1] as u8,
+            lapic.regs[tmict_offset + 2] as u8,
+            lapic.regs[tmict_offset + 3] as u8,
+        ]);
+
+        // Bootstrap the LAPIC timer if it won't fire on its own.
+        //
+        // IMPORTANT: Only bootstrap vCPU 0 (BSP).  Secondary vCPUs may be in
+        // HALTED/INIT/SIPI state because the kernel never brought them online
+        // (e.g. maxcpus=1) or they're parked in idle.  Injecting periodic
+        // timer ticks into an AP whose timer subsystem was never initialized
+        // causes kernel panics.  The BSP will IPI them when needed.
+        let needs_bootstrap = vcpu_id == 0
+            && (timer_masked == 1
+                || timer_mode == 2 // TSC-deadline: stale after restore
+                || (timer_mode == 0 && current_tmict == 0)); // oneshot, disarmed
+
+        if needs_bootstrap {
+            // Reconfigure to periodic mode with LOCAL_TIMER_VECTOR (0xEC)
+            // and unmask it so ticks bootstrap the scheduler on every vCPU.
             //
-            // We use periodic mode (not TSC-deadline) because:
-            //   - The kernel's clockevent state is stale after restore
-            //   - With TSC-deadline, the kernel expects to manage the MSR and
-            //     may never re-arm it after the stale clockevent fires
-            //   - Periodic mode is self-sustaining: the LAPIC hardware
-            //     regenerates ticks from TMICT/TDCR without kernel re-arming
-            //
-            // Once the kernel's timer subsystem initializes, it may switch to
-            // TSC-deadline (if not disabled) and reprogram LVTT accordingly.
+            // Periodic mode is self-sustaining: the LAPIC hardware
+            // regenerates ticks from TMICT/TDCR without kernel re-arming.
+            // Once the kernel's timer subsystem re-initializes, it may
+            // switch to TSC-deadline and reprogram LVTT accordingly.
             let new_lvt: u32 = (0b01 << 17) | 0xEC; // Periodic, vector 0xEC, unmasked
             let bytes = new_lvt.to_le_bytes();
             lapic.regs[lvt_timer_offset] = bytes[0] as _;
@@ -223,7 +245,6 @@ pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
             // gives roughly 1ms ticks — fast enough to bootstrap the scheduler
             // but slow enough not to overwhelm a single vCPU.
             let tmict: u32 = 0x200000; // ~2M counts
-            let tmict_offset = 0x380;
             let tmict_bytes = tmict.to_le_bytes();
             lapic.regs[tmict_offset] = tmict_bytes[0] as _;
             lapic.regs[tmict_offset + 1] = tmict_bytes[1] as _;
@@ -240,8 +261,8 @@ pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
             lapic.regs[tdcr_offset + 3] = tdcr_bytes[3] as _;
 
             debug!(
-                "Fixed LAPIC LVT Timer: {:#x} -> {:#x} (periodic, vector 0xEC, TMICT={:#x}, TDCR={:#x})",
-                lvt_timer, new_lvt, tmict, tdcr
+                "LAPIC timer bootstrap: LVT {:#x} -> {:#x} (masked={}, mode={}, vec={:#x}, old_tmict={:#x})",
+                lvt_timer, new_lvt, timer_masked, timer_mode, timer_vector, current_tmict
             );
         }
     }
@@ -284,7 +305,17 @@ pub fn restore_vcpu_state(vcpu_fd: &VcpuFd, state: &VcpuState) -> Result<()> {
     // 7. General-purpose registers last (includes RIP — execution resumes here)
     vcpu_fd.set_regs(&regs).map_err(Error::Kvm)?;
 
-    // 8. KVM_KVMCLOCK_CTRL — tell KVM the guest was paused so the pvclock
+    // 8. MP state (RUNNABLE, HALTED, INIT_RECEIVED, SIPI_RECEIVED).
+    //    Critical for SMP: without this, secondary vCPUs default to RUNNABLE
+    //    instead of their actual state (usually HALTED), breaking SMP resume.
+    if let Some(mp) = state.mp_state {
+        use kvm_bindings::kvm_mp_state;
+        let mp_state = kvm_mp_state { mp_state: mp };
+        vcpu_fd.set_mp_state(mp_state).map_err(Error::Kvm)?;
+        debug!("Restored MP state: {}", mp);
+    }
+
+    // 9. KVM_KVMCLOCK_CTRL — tell KVM the guest was paused so the pvclock
     //    sets KVM_CLOCK_PAUSED.  The guest kernel reads this on resume and
     //    adjusts its timers to avoid soft lockup watchdog panics.
     if let Err(e) = vcpu_fd.kvmclock_ctrl() {
@@ -397,7 +428,7 @@ pub fn create_vcpu_restored(
     configure_cpuid(&vm, &vcpu_fd)?;
 
     // Restore full register state from snapshot
-    restore_vcpu_state(&vcpu_fd, state)?;
+    restore_vcpu_state(&vcpu_fd, state, vcpu_id)?;
 
     // Start vCPU thread with state capture on exit
     spawn_vcpu_thread(vm, vcpu_fd, vcpu_id, running, serial, mmio_devices)
