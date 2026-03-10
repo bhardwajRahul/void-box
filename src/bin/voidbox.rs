@@ -338,7 +338,7 @@ async fn get_remote_messages(
 #[cfg(target_os = "linux")]
 async fn cmd_snapshot(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("usage: voidbox snapshot <create|list|delete> [options]");
+        eprintln!("usage: voidbox snapshot <create|list|delete> [options] [--diff]");
         std::process::exit(1);
     }
 
@@ -348,7 +348,7 @@ async fn cmd_snapshot(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         "delete" => cmd_snapshot_delete(&args[1..]),
         _ => {
             eprintln!("unknown snapshot subcommand: {}", args[0]);
-            eprintln!("usage: voidbox snapshot <create|list|delete>");
+            eprintln!("usage: voidbox snapshot <create|list|delete> [--diff]");
             std::process::exit(1);
         }
     }
@@ -377,8 +377,11 @@ async fn cmd_snapshot_create(args: &[String]) -> Result<(), Box<dyn std::error::
         .unwrap_or_else(|| "1".to_string())
         .parse()?;
 
+    let is_diff = args.contains(&"--diff".to_string());
+
     eprintln!(
-        "Creating snapshot: kernel={}, initramfs={:?}, memory={}MB, vcpus={}",
+        "Creating {} snapshot: kernel={}, initramfs={:?}, memory={}MB, vcpus={}",
+        if is_diff { "diff" } else { "base" },
         kernel.display(),
         initramfs.as_ref().map(|p| p.display()),
         memory_mb,
@@ -388,74 +391,160 @@ async fn cmd_snapshot_create(args: &[String]) -> Result<(), Box<dyn std::error::
     // Compute config hash
     let config_hash =
         snapshot::compute_config_hash(&kernel, initramfs.as_deref(), memory_mb, vcpus)?;
-    let snapshot_dir = snapshot::snapshot_dir_for_hash(&config_hash);
     eprintln!("Config hash: {}", &config_hash[..16]);
 
-    // Ensure snapshot directory exists
-    fs::create_dir_all(&snapshot_dir)?;
+    if is_diff {
+        // --- Diff snapshot flow ---
+        let base_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+        if !base_dir.join("state.bin").exists() {
+            eprintln!("No base snapshot found. Create one first:");
+            eprintln!(
+                "  voidbox snapshot create --kernel {} {}--memory {} --vcpus {}",
+                kernel.display(),
+                initramfs
+                    .as_ref()
+                    .map(|p| format!("--initramfs {} ", p.display()))
+                    .unwrap_or_default(),
+                memory_mb,
+                vcpus
+            );
+            std::process::exit(1);
+        }
 
-    // Check for existing snapshot
-    if snapshot_dir.join("state.bin").exists() {
-        eprintln!("Snapshot already exists at {}", snapshot_dir.display());
+        let diff_dir_name = format!("{}-diff", &config_hash[..16]);
+        let diff_dir = snapshot::default_snapshot_dir().join(&diff_dir_name);
+        fs::create_dir_all(&diff_dir)?;
+
+        if diff_dir.join("state.bin").exists() {
+            eprintln!("Diff snapshot already exists at {}", diff_dir.display());
+            eprintln!(
+                "Delete it first with: voidbox snapshot delete {}-diff",
+                &config_hash[..16]
+            );
+            std::process::exit(1);
+        }
+
+        let start = std::time::Instant::now();
+        eprintln!("Restoring VM from base snapshot...");
+        let vm = MicroVm::from_snapshot(&base_dir).await?;
+        let restore_ms = start.elapsed().as_millis();
+        eprintln!("VM restored in {}ms", restore_ms);
+
+        eprintln!("Enabling dirty page tracking...");
+        vm.enable_dirty_tracking()?;
+
+        eprintln!("Waiting for guest-agent readiness...");
+        let output = vm.exec("echo", &["snapshot-ready"]).await?;
+        if !output.success() {
+            return Err(format!("Guest-agent not ready: {}", output.stderr_str()).into());
+        }
         eprintln!(
-            "Delete it first with: voidbox snapshot delete {}",
-            &config_hash[..16]
+            "Guest-agent ready ({}ms total)",
+            start.elapsed().as_millis()
         );
-        std::process::exit(1);
+
+        let snap_config = snapshot::SnapshotConfig {
+            memory_mb,
+            vcpus,
+            cid: vm.cid(),
+            vsock_mmio_base: 0xd080_0000,
+            network: void_box::vmm::config::VoidBoxConfig::new().network,
+        };
+
+        let snap_dir = vm
+            .snapshot_diff(
+                &diff_dir,
+                config_hash.clone(),
+                snap_config,
+                config_hash.clone(),
+            )
+            .await?;
+        let total_ms = start.elapsed().as_millis();
+
+        let diff_mem_size = fs::metadata(snapshot::VmSnapshot::diff_memory_path(&snap_dir))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let base_mem_size = fs::metadata(snapshot::VmSnapshot::memory_path(&base_dir))
+            .map(|m| m.len())
+            .unwrap_or(1);
+
+        let savings = if base_mem_size > 0 {
+            100.0 - (diff_mem_size as f64 / base_mem_size as f64 * 100.0)
+        } else {
+            0.0
+        };
+
+        eprintln!("Diff snapshot created successfully:");
+        eprintln!("  Hash:      {}", &config_hash[..16]);
+        eprintln!("  Path:      {}", snap_dir.display());
+        eprintln!("  Duration:  {}ms", total_ms);
+        eprintln!(
+            "  Diff mem:  {} KB ({:.1}% savings vs base)",
+            diff_mem_size / 1024,
+            savings
+        );
+    } else {
+        // --- Base snapshot flow (existing) ---
+        let snapshot_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+        fs::create_dir_all(&snapshot_dir)?;
+
+        if snapshot_dir.join("state.bin").exists() {
+            eprintln!("Snapshot already exists at {}", snapshot_dir.display());
+            eprintln!(
+                "Delete it first with: voidbox snapshot delete {}",
+                &config_hash[..16]
+            );
+            std::process::exit(1);
+        }
+
+        let mut config = VoidBoxConfig::new()
+            .kernel(&kernel)
+            .memory_mb(memory_mb)
+            .vcpus(vcpus)
+            .enable_vsock(true)
+            .vsock_backend(void_box::vmm::config::VsockBackendType::Userspace);
+        if let Some(ref initramfs) = initramfs {
+            config = config.initramfs(initramfs);
+        }
+
+        let start = std::time::Instant::now();
+        eprintln!("Booting VM...");
+        let vm = MicroVm::new(config.clone()).await?;
+        let boot_ms = start.elapsed().as_millis();
+        eprintln!("VM booted in {}ms, waiting for guest-agent...", boot_ms);
+
+        let output = vm.exec("echo", &["snapshot-ready"]).await?;
+        if !output.success() {
+            return Err(format!("Guest-agent not ready: {}", output.stderr_str()).into());
+        }
+        eprintln!(
+            "Guest-agent ready ({}ms total)",
+            start.elapsed().as_millis()
+        );
+
+        let snap_config = snapshot::SnapshotConfig {
+            memory_mb,
+            vcpus,
+            cid: vm.cid(),
+            vsock_mmio_base: 0xd080_0000,
+            network: config.network,
+        };
+
+        let snap_dir = vm
+            .snapshot(&snapshot_dir, config_hash.clone(), snap_config)
+            .await?;
+        let total_ms = start.elapsed().as_millis();
+
+        eprintln!("Snapshot created successfully:");
+        eprintln!("  Hash:     {}", &config_hash[..16]);
+        eprintln!("  Path:     {}", snap_dir.display());
+        eprintln!("  Duration: {}ms", total_ms);
+
+        let mem_size = fs::metadata(snapshot::VmSnapshot::memory_path(&snap_dir))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        eprintln!("  Memory:   {} MB", mem_size / (1024 * 1024));
     }
-
-    // Build VM config — snapshot/restore requires the userspace vsock backend
-    let mut config = VoidBoxConfig::new()
-        .kernel(&kernel)
-        .memory_mb(memory_mb)
-        .vcpus(vcpus)
-        .enable_vsock(true)
-        .vsock_backend(void_box::vmm::config::VsockBackendType::Userspace);
-    if let Some(ref initramfs) = initramfs {
-        config = config.initramfs(initramfs);
-    }
-
-    // Boot VM
-    let start = std::time::Instant::now();
-    eprintln!("Booting VM...");
-    let vm = MicroVm::new(config.clone()).await?;
-    let boot_ms = start.elapsed().as_millis();
-    eprintln!("VM booted in {}ms, waiting for guest-agent...", boot_ms);
-
-    // Wait a moment for guest-agent to initialize
-    // (The first vsock exec will do the ping/pong handshake)
-    let output = vm.exec("echo", &["snapshot-ready"]).await?;
-    if !output.success() {
-        return Err(format!("Guest-agent not ready: {}", output.stderr_str()).into());
-    }
-    eprintln!(
-        "Guest-agent ready ({}ms total)",
-        start.elapsed().as_millis()
-    );
-
-    // Create snapshot
-    let snap_config = snapshot::SnapshotConfig {
-        memory_mb,
-        vcpus,
-        cid: vm.cid(),
-        vsock_mmio_base: 0xd080_0000,
-        network: config.network,
-    };
-
-    let snap_dir = vm
-        .snapshot(&snapshot_dir, config_hash.clone(), snap_config)
-        .await?;
-    let total_ms = start.elapsed().as_millis();
-
-    eprintln!("Snapshot created successfully:");
-    eprintln!("  Hash:     {}", &config_hash[..16]);
-    eprintln!("  Path:     {}", snap_dir.display());
-    eprintln!("  Duration: {}ms", total_ms);
-
-    let mem_size = fs::metadata(snapshot::VmSnapshot::memory_path(&snap_dir))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    eprintln!("  Memory:   {} MB", mem_size / (1024 * 1024));
 
     Ok(())
 }

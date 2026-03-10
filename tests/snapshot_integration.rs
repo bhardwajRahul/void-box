@@ -1005,3 +1005,175 @@ async fn snapshot_cli_delete() {
     );
     eprintln!("[cli_delete] Snapshot deleted and verified gone");
 }
+
+// ---------------------------------------------------------------------------
+// Test: Diff snapshot CLI flow (base → restore → dirty tracking → diff)
+// ---------------------------------------------------------------------------
+
+/// Create a base snapshot, then create a diff snapshot on top of it (the same
+/// flow that `voidbox snapshot create --diff` performs). Verify that
+/// `list_snapshots()` returns both entries and that the diff is smaller than
+/// the base.
+#[tokio::test]
+#[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
+async fn snapshot_cli_create_diff() {
+    let Some((kernel, initramfs)) = preflight() else {
+        return;
+    };
+    let cfg = build_config(&kernel, initramfs.as_deref());
+
+    // --- Cold boot & base snapshot ---
+    eprintln!("[cli_create_diff] Booting VM...");
+    let vm = match MicroVm::new(cfg).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  failed to create VM: {e}");
+            return;
+        }
+    };
+    let output = match vm.exec("echo", &["ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  exec failed: {e}");
+            return;
+        }
+    };
+    assert!(output.success());
+
+    let config_hash =
+        snapshot::compute_config_hash(&kernel, initramfs.as_deref(), 256, 1).expect("hash");
+    let base_dir = snapshot::snapshot_dir_for_hash(&config_hash);
+    std::fs::create_dir_all(&base_dir).expect("create base snapshot dir");
+
+    eprintln!(
+        "[cli_create_diff] Taking base snapshot (hash={})...",
+        &config_hash[..16]
+    );
+    match vm
+        .snapshot(&base_dir, config_hash.clone(), snap_config())
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("  base snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    }
+
+    let base_mem_size = std::fs::metadata(VmSnapshot::memory_path(&base_dir))
+        .unwrap()
+        .len();
+    eprintln!(
+        "[cli_create_diff] Base memory size: {} bytes",
+        base_mem_size
+    );
+
+    // --- Restore from base, enable dirty tracking, exec, take diff ---
+    eprintln!("[cli_create_diff] Restoring from base snapshot...");
+    let restored_vm = match MicroVm::from_snapshot(&base_dir).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("  base restore failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+
+    eprintln!("[cli_create_diff] Enabling dirty page tracking...");
+    restored_vm
+        .enable_dirty_tracking()
+        .expect("enable dirty tracking");
+
+    let output = match restored_vm.exec("echo", &["snapshot-ready"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("  exec after dirty tracking failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            return;
+        }
+    };
+    assert!(output.success());
+    eprintln!("[cli_create_diff] Guest-agent ready after dirty tracking");
+
+    let diff_dir_name = format!("{}-diff", &config_hash[..16]);
+    let diff_dir = snapshot::default_snapshot_dir().join(&diff_dir_name);
+    std::fs::create_dir_all(&diff_dir).expect("create diff snapshot dir");
+
+    eprintln!("[cli_create_diff] Taking diff snapshot...");
+    let diff_path = match restored_vm
+        .snapshot_diff(
+            &diff_dir,
+            config_hash.clone(),
+            snap_config(),
+            config_hash.clone(),
+        )
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("  diff snapshot failed: {e}");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            let _ = std::fs::remove_dir_all(&diff_dir);
+            return;
+        }
+    };
+
+    // --- Verify list_snapshots() includes both base and diff ---
+    let snapshots = snapshot::list_snapshots().expect("list_snapshots");
+    let base_found = snapshots
+        .iter()
+        .any(|s| s.config_hash == config_hash && s.snapshot_type == snapshot::SnapshotType::Base);
+    let diff_found = snapshots
+        .iter()
+        .any(|s| s.snapshot_type == snapshot::SnapshotType::Diff);
+    assert!(base_found, "list_snapshots must include the base snapshot");
+    assert!(diff_found, "list_snapshots must include the diff snapshot");
+    eprintln!(
+        "[cli_create_diff] list_snapshots: {} entries (base={}, diff={})",
+        snapshots.len(),
+        base_found,
+        diff_found
+    );
+
+    // --- Verify diff memory is smaller than base ---
+    let diff_mem_size = std::fs::metadata(VmSnapshot::diff_memory_path(&diff_path))
+        .unwrap()
+        .len();
+    eprintln!(
+        "[cli_create_diff] Base memory: {} bytes, Diff memory: {} bytes ({:.1}%)",
+        base_mem_size,
+        diff_mem_size,
+        (diff_mem_size as f64 / base_mem_size as f64) * 100.0
+    );
+    assert!(
+        diff_mem_size < base_mem_size,
+        "diff memory ({diff_mem_size}) must be smaller than base ({base_mem_size})"
+    );
+
+    // --- Verify diff snapshot metadata ---
+    let diff_snap = VmSnapshot::load(&diff_path).expect("load diff snapshot");
+    assert_eq!(
+        diff_snap.snapshot_type,
+        snapshot::SnapshotType::Diff,
+        "must be a diff snapshot"
+    );
+    assert_eq!(
+        diff_snap.parent_id.as_deref(),
+        Some(config_hash.as_str()),
+        "diff snapshot parent_id must match config_hash"
+    );
+
+    // --- Summary ---
+    let savings = (1.0 - diff_mem_size as f64 / base_mem_size as f64) * 100.0;
+    eprintln!();
+    eprintln!("=== Diff Snapshot CLI Summary ===");
+    eprintln!("  Base memory:     {} MB", base_mem_size / (1024 * 1024));
+    eprintln!("  Diff memory:     {} KB", diff_mem_size / 1024);
+    eprintln!("  Savings:         {:.1}%", savings);
+    eprintln!("=================================");
+
+    // --- Cleanup ---
+    let _ = std::fs::remove_dir_all(&base_dir);
+    let _ = std::fs::remove_dir_all(&diff_dir);
+}
