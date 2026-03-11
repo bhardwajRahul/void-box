@@ -1,0 +1,36 @@
+# Snapshot Restore Example
+#
+# Restores a VM from a previously captured snapshot instead of cold-booting.
+# The snapshot path can be:
+#   - A hash prefix (e.g. "60e3c527") → resolves to ~/.void-box/snapshots/<prefix>/
+#   - A literal directory path containing state.bin + memory.mem
+#
+# To create a snapshot first:
+#   voidbox snapshot create
+#
+# Then find the hash prefix with `voidbox snapshot list` and set it below.
+#
+# Run:
+#   VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
+#   cargo run --bin voidbox -- run --file examples/specs/snapshot_restore.yaml
+
+api_version: v1
+kind: agent
+name: snapshot_demo
+
+sandbox:
+  mode: auto
+  memory_mb: 2048
+  vcpus: 1
+  network: false
+  # Restore from a snapshot instead of cold-booting.
+  # Set this to a snapshot hash prefix or directory path.
+  # Comment out to fall back to normal cold boot.
+  # snapshot: "60e3c527"
+
+llm:
+  provider: claude
+
+agent:
+  prompt: "Say exactly: Hello from a snapshot-restored VM! Then stop."
+  timeout_secs: 60
