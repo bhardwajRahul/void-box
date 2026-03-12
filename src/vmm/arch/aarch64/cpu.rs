@@ -18,7 +18,7 @@ const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
 const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
 const KVM_REG_ARM_CORE: u64 = 0x0010_0000_0000_0000;
 const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000_0000_0000;
-const KVM_REG_ARM64_SVE: u64 = 0x0015_0000_0000_0000;
+const _KVM_REG_ARM64_SVE: u64 = 0x0015_0000_0000_0000;
 
 /// Encode a core register ID by its offset in `kvm_regs` (in u64 units).
 const fn core_reg(offset: u64) -> u64 {
@@ -85,7 +85,10 @@ fn timer_reg_ids() -> Vec<u64> {
 /// Calls `KVM_ARM_VCPU_INIT` then sets the entry point (PC) and DTB address (x0).
 pub fn configure_vcpu(vcpu_fd: &VcpuFd, _vcpu_id: u64, entry_point: u64, vm: &Vm) -> Result<()> {
     // Get the preferred target for this VM.
-    let kvi = vm.vm_fd().get_preferred_target().map_err(Error::Kvm)?;
+    let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+    vm.vm_fd()
+        .get_preferred_target(&mut kvi)
+        .map_err(Error::Kvm)?;
 
     // Initialize the vCPU with the preferred target.
     vcpu_fd.vcpu_init(&kvi).map_err(Error::Kvm)?;

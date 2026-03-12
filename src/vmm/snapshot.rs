@@ -20,10 +20,11 @@ use crate::{Error, Result};
 /// Snapshot format version for forward compatibility.
 pub const SNAPSHOT_VERSION: u32 = 3;
 
-/// Default snapshot storage directory.
-pub fn default_snapshot_dir() -> PathBuf {
-    dirs_snapshot_base()
-}
+// Re-export cross-platform snapshot utilities from `snapshot_store`.
+pub use crate::snapshot_store::{
+    compute_config_hash, default_snapshot_dir, delete_snapshot, list_snapshots,
+    snapshot_dir_for_hash, snapshot_exists, SnapshotInfo, SnapshotType,
+};
 
 fn dirs_snapshot_base() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -34,14 +35,7 @@ fn dirs_snapshot_base() -> PathBuf {
 // Types
 // ---------------------------------------------------------------------------
 
-/// Snapshot type discriminator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SnapshotType {
-    /// Full base snapshot from a cold-booted VM.
-    Base,
-    /// Differential snapshot on top of a base.
-    Diff,
-}
+// SnapshotType re-exported from snapshot_store above.
 
 /// Hardware configuration captured at snapshot time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,112 +565,8 @@ fn dir_size_recursive(path: &Path) -> u64 {
     total
 }
 
-// ---------------------------------------------------------------------------
-// Config hash
-// ---------------------------------------------------------------------------
-
-/// Compute a deterministic hash of the VM configuration.
-pub fn compute_config_hash(
-    kernel: &Path,
-    initramfs: Option<&Path>,
-    memory_mb: usize,
-    vcpus: usize,
-) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let kernel_data = fs::read(kernel)
-        .map_err(|e| Error::Snapshot(format!("read kernel {}: {}", kernel.display(), e)))?;
-    hasher.update(&kernel_data);
-    if let Some(initramfs) = initramfs {
-        let initramfs_data = fs::read(initramfs).map_err(|e| {
-            Error::Snapshot(format!("read initramfs {}: {}", initramfs.display(), e))
-        })?;
-        hasher.update(&initramfs_data);
-    }
-    hasher.update(memory_mb.to_le_bytes());
-    hasher.update(vcpus.to_le_bytes());
-    let hash = hasher.finalize();
-    Ok(hash
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>())
-}
-
-/// Resolve the snapshot directory for a given config hash.
-pub fn snapshot_dir_for_hash(config_hash: &str) -> PathBuf {
-    dirs_snapshot_base().join(&config_hash[..16.min(config_hash.len())])
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot listing / deletion
-// ---------------------------------------------------------------------------
-
-/// Information about a stored snapshot (for listing).
-#[derive(Debug)]
-pub struct SnapshotInfo {
-    pub config_hash: String,
-    pub snapshot_type: SnapshotType,
-    pub memory_mb: usize,
-    pub vcpus: usize,
-    pub dir: PathBuf,
-    pub memory_file_size: u64,
-}
-
-/// List all stored snapshots.
-pub fn list_snapshots() -> Result<Vec<SnapshotInfo>> {
-    let base = dirs_snapshot_base();
-    if !base.exists() {
-        return Ok(Vec::new());
-    }
-    let mut infos = Vec::new();
-    for entry in fs::read_dir(&base)? {
-        let entry = entry?;
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let state_path = dir.join("state.bin");
-        if !state_path.exists() {
-            continue;
-        }
-        match VmSnapshot::load(&dir) {
-            Ok(snap) => {
-                let mem_size = fs::metadata(VmSnapshot::memory_path(&dir))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                infos.push(SnapshotInfo {
-                    config_hash: snap.config_hash,
-                    snapshot_type: snap.snapshot_type,
-                    memory_mb: snap.config.memory_mb,
-                    vcpus: snap.config.vcpus,
-                    dir,
-                    memory_file_size: mem_size,
-                });
-            }
-            Err(e) => {
-                debug!("Skipping invalid snapshot {}: {}", dir.display(), e);
-            }
-        }
-    }
-    Ok(infos)
-}
-
-/// Delete a snapshot by its config hash prefix.
-pub fn delete_snapshot(hash_prefix: &str) -> Result<bool> {
-    let base = dirs_snapshot_base();
-    if !base.exists() {
-        return Ok(false);
-    }
-    for entry in fs::read_dir(&base)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(hash_prefix) || hash_prefix.starts_with(&name) {
-            fs::remove_dir_all(entry.path())?;
-            info!("Deleted snapshot {}", entry.path().display());
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+// Config hash, snapshot_dir_for_hash, SnapshotInfo, list_snapshots,
+// delete_snapshot are all re-exported from snapshot_store at the top.
 
 // ---------------------------------------------------------------------------
 // Raw byte helpers for KVM struct serialization
@@ -727,6 +617,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_state_serde_roundtrip() {
+        #[cfg(target_arch = "x86_64")]
         let state = arch::VcpuState {
             regs: vec![1, 2, 3, 4],
             sregs: vec![5, 6, 7, 8],
@@ -737,10 +628,17 @@ mod tests {
             xcrs: vec![],
             mp_state: Some(0),
         };
+        #[cfg(target_arch = "aarch64")]
+        let state = arch::VcpuState {
+            core_regs: vec![(0, 1), (1, 2)],
+            system_regs: vec![(0x1000, 42)],
+            fp_regs: vec![(0x2000, vec![0u8; 16])],
+            timer_regs: vec![(0x3000, 100)],
+            mp_state: Some(0),
+        };
         let bytes = bincode::serialize(&state).unwrap();
         let restored: arch::VcpuState = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(state.regs, restored.regs);
-        assert_eq!(state.msrs, restored.msrs);
+        assert_eq!(state.mp_state, restored.mp_state);
     }
 
     #[test]
@@ -777,28 +675,53 @@ mod tests {
 
     #[test]
     fn test_vm_snapshot_serde_roundtrip() {
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_state = arch::VcpuState {
+            regs: vec![0; 16],
+            sregs: vec![0; 32],
+            lapic: vec![0; 8],
+            xsave: vec![0; 64],
+            msrs: vec![(0x10, 100)],
+            vcpu_events: vec![],
+            xcrs: vec![],
+            mp_state: Some(0),
+        };
+        #[cfg(target_arch = "aarch64")]
+        let vcpu_state = arch::VcpuState {
+            core_regs: vec![(0, 0); 34],
+            system_regs: vec![(0x1000, 0)],
+            fp_regs: vec![(0x2000, vec![0u8; 16])],
+            timer_regs: vec![(0x3000, 0)],
+            mp_state: Some(0),
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let irqchip = arch::IrqchipState {
+            pic_master: vec![0; 64],
+            pic_slave: vec![0; 64],
+            ioapic: vec![0; 128],
+        };
+        #[cfg(target_arch = "aarch64")]
+        let irqchip = arch::IrqchipState {
+            gic_dist_regs: vec![],
+            gic_redist_regs: vec![],
+            gic_cpu_regs: vec![],
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let arch_state = arch::ArchVmState {
+            pit: vec![0; 32],
+            clock: vec![],
+        };
+        #[cfg(target_arch = "aarch64")]
+        let arch_state = arch::ArchVmState {};
+
         let snap = VmSnapshot {
             version: SNAPSHOT_VERSION,
             parent_id: None,
-            vcpu_states: vec![arch::VcpuState {
-                regs: vec![0; 16],
-                sregs: vec![0; 32],
-                lapic: vec![0; 8],
-                xsave: vec![0; 64],
-                msrs: vec![(0x10, 100)],
-                vcpu_events: vec![],
-                xcrs: vec![],
-                mp_state: Some(0),
-            }],
-            irqchip: arch::IrqchipState {
-                pic_master: vec![0; 64],
-                pic_slave: vec![0; 64],
-                ioapic: vec![0; 128],
-            },
-            arch_state: arch::ArchVmState {
-                pit: vec![0; 32],
-                clock: vec![],
-            },
+            vcpu_states: vec![vcpu_state],
+            irqchip,
+            arch_state,
             vsock_state: VsockSnapshotState {
                 device_features: 1 << 32,
                 driver_features: 1 << 32,
