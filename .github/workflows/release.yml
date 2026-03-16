@@ -34,11 +34,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools cpio gzip xz-utils zstd
 
-      - name: Install aarch64 cross-compiler
+      - name: Install aarch64 musl cross-compiler
         if: matrix.arch == 'aarch64'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          sudo ln -s /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Download static busybox
         run: |
@@ -64,8 +64,9 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -sfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz \
-            | tar -xz -C /usr/local/bin nfpm
+          curl -sfL --retry 3 --retry-delay 5 https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_linux_amd64.tar.gz \
+            -o /tmp/nfpm.tar.gz
+          tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
 
       - name: Build .deb package
         run: |
