@@ -1505,11 +1505,11 @@ fn net_poll_thread(net_dev: Arc<Mutex<VirtioNetDevice>>, vm: Arc<Vm>, running: A
         if has_interrupt {
             let assert_irq = KvmIrqLevel { irq: 10, level: 1 };
             unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert_irq);
+                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert_irq);
             }
             let deassert_irq = KvmIrqLevel { irq: 10, level: 0 };
             unsafe {
-                libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert_irq);
+                libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert_irq);
             }
         }
     }

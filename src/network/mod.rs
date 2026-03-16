@@ -106,7 +106,7 @@ impl TapDevice {
 
             // TUNSETIFF ioctl: from <linux/if_tun.h>
             const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-            let ret = libc::ioctl(fd, TUNSETIFF, &ifr);
+            let ret = libc::ioctl(fd, TUNSETIFF as _, &ifr);
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 libc::close(fd);

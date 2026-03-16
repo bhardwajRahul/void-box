@@ -422,11 +422,11 @@ pub(crate) fn inject_irq(vm_fd: i32, irq: u32) {
     const KVM_IRQ_LINE: libc::c_ulong = 0x4008_AE61;
     let assert = KvmIrqLevel { irq, level: 1 };
     unsafe {
-        libc::ioctl(vm_fd, KVM_IRQ_LINE, &assert);
+        libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &assert);
     }
     let deassert = KvmIrqLevel { irq, level: 0 };
     unsafe {
-        libc::ioctl(vm_fd, KVM_IRQ_LINE, &deassert);
+        libc::ioctl(vm_fd, KVM_IRQ_LINE as _, &deassert);
     }
 }
 
@@ -445,7 +445,7 @@ unsafe fn set_kvm_signal_mask(vcpu_fd: i32) {
         len: 8,
         sigset: [0u8; 8],
     };
-    libc::ioctl(vcpu_fd, KVM_SET_SIGNAL_MASK, &mask);
+    libc::ioctl(vcpu_fd, KVM_SET_SIGNAL_MASK as _, &mask);
 }
 
 /// Handle I/O port output (guest writing to port)

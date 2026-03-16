@@ -174,8 +174,7 @@ impl VirtioVsockMmio {
         // SET_GUEST_CID
         const VHOST_VSOCK_SET_GUEST_CID: u64 = 0x4008AF60;
         let cid_val: u64 = cid as u64;
-        let ret =
-            unsafe { libc::ioctl(raw_fd, VHOST_VSOCK_SET_GUEST_CID as libc::c_ulong, &cid_val) };
+        let ret = unsafe { libc::ioctl(raw_fd, VHOST_VSOCK_SET_GUEST_CID as _, &cid_val) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
             unsafe {
@@ -291,7 +290,7 @@ impl VirtioVsockMmio {
         };
         let val: std::ffi::c_int = if running { 1 } else { 0 };
         const VHOST_VSOCK_SET_RUNNING: u64 = 0x4004AF61;
-        let ret = unsafe { libc::ioctl(fd, VHOST_VSOCK_SET_RUNNING as libc::c_ulong, &val) };
+        let ret = unsafe { libc::ioctl(fd, VHOST_VSOCK_SET_RUNNING as _, &val) };
 
         if ret < 0 {
             return Err(Error::Device(format!(
@@ -313,7 +312,7 @@ impl VirtioVsockMmio {
             return Ok(());
         }
 
-        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_OWNER as libc::c_ulong) };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_OWNER as _) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             // EBUSY means owner already set - that's OK
@@ -340,13 +339,7 @@ impl VirtioVsockMmio {
             reg.userspace_addr = host_addr as u64;
         }
 
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_MEM_TABLE as libc::c_ulong,
-                buf.as_ptr(),
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_MEM_TABLE as _, buf.as_ptr()) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_MEM_TABLE: {}",
@@ -391,13 +384,7 @@ impl VirtioVsockMmio {
             as u64;
 
         let state = VhostVringState { index, num };
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_VRING_NUM as libc::c_ulong,
-                &state,
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_NUM as _, &state) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_VRING_NUM: {}",
@@ -413,13 +400,7 @@ impl VirtioVsockMmio {
             avail_user_addr: avail_host,
             log_guest_addr: 0,
         };
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_VRING_ADDR as libc::c_ulong,
-                &addr,
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_ADDR as _, &addr) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_VRING_ADDR: {}",
@@ -428,13 +409,7 @@ impl VirtioVsockMmio {
         }
 
         let base_state = VhostVringState { index, num: 0 };
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_VRING_BASE as libc::c_ulong,
-                &base_state,
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_BASE as _, &base_state) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_VRING_BASE: {}",
@@ -448,13 +423,7 @@ impl VirtioVsockMmio {
             fd: i32,
         }
         let kick_file = VhostVringFile { index, fd: kick_fd };
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_VRING_KICK as libc::c_ulong,
-                &kick_file,
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_KICK as _, &kick_file) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_VRING_KICK: {}",
@@ -463,13 +432,7 @@ impl VirtioVsockMmio {
         }
 
         let call_file = VhostVringFile { index, fd: call_fd };
-        let ret = unsafe {
-            libc::ioctl(
-                fd,
-                vhost_ioctl::VHOST_SET_VRING_CALL as libc::c_ulong,
-                &call_file,
-            )
-        };
+        let ret = unsafe { libc::ioctl(fd, vhost_ioctl::VHOST_SET_VRING_CALL as _, &call_file) };
         if ret < 0 {
             return Err(Error::Device(format!(
                 "VHOST_SET_VRING_CALL: {}",
