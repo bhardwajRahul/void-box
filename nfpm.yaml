@@ -2,8 +2,8 @@
 # https://nfpm.goreleaser.com/configuration/
 #
 # Build packages:
-#   VERSION=0.1.1 ARCH=x86_64 nfpm package --packager deb --target dist/
-#   VERSION=0.1.1 ARCH=x86_64 nfpm package --packager rpm --target dist/
+#   VERSION=0.1.2 ARCH=x86_64 nfpm package --packager deb --target dist/
+#   VERSION=0.1.2 ARCH=x86_64 nfpm package --packager rpm --target dist/
 #
 # Environment variables:
 #   VERSION  — package version (e.g. 0.1.1), required

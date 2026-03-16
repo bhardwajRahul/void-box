@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-03-16
+## [0.1.2] - 2026-03-16
 
 ### Added
 - **Snapshot/Restore** for KVM: base and diff snapshots with multi-vCPU support, userspace virtio-vsock backend
@@ -130,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automated release builds
 - Documentation generation
 
-[Unreleased]: https://github.com/the-void-ia/void-box/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/the-void-ia/void-box/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/the-void-ia/void-box/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/the-void-ia/void-box/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/the-void-ia/void-box/releases/tag/v0.1.0
