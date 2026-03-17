@@ -77,7 +77,7 @@ jobs:
 
       - name: Build .deb package
         run: |
-          VERSION="${{ github.ref_name }}" ARCH="${{ matrix.arch }}" \
+          VERSION="${VERSION#v}" ARCH="$ARCH" \
             nfpm package --packager deb --target target/release-artifacts/${{ github.ref_name }}/
         env:
           VERSION: ${{ github.ref_name }}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          VERSION="${{ github.ref_name }}" ARCH="${{ matrix.arch }}" \
+          VERSION="${VERSION#v}" ARCH="$ARCH" \
             nfpm package --packager rpm --target target/release-artifacts/${{ github.ref_name }}/
         env:
           VERSION: ${{ github.ref_name }}

@@ -49,6 +49,7 @@ echo "[void-box] Guest agent built: $RELEASE_DIR/guest-agent-${ARCH}"
 # ── 3. Build initramfs ──────────────────────────────────────────────────────
 
 echo "[void-box] Building initramfs..."
+ARCH="$ARCH" \
 OUT_DIR="$RELEASE_DIR/rootfs-tmp" \
 OUT_CPIO="$RELEASE_DIR/void-box-initramfs-${VERSION}-${ARCH}.cpio.gz" \
   ./scripts/build_guest_image.sh

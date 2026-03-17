@@ -11,7 +11,7 @@
 
 name: voidbox
 arch: "${ARCH}"
-version: "v${VERSION}"
+version: "${VERSION}"
 maintainer: "Diego Parra <diegolparra@gmail.com>"
 description: "Composable workflow sandbox with KVM micro-VMs and native observability"
 homepage: "https://github.com/the-void-ia/void-box"
