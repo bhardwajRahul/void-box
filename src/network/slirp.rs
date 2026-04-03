@@ -30,6 +30,12 @@ struct DnsCacheEntry {
     expires: Instant,
 }
 
+/// A DNS query waiting to be resolved on the net-poll thread.
+struct PendingDnsQuery {
+    query: Vec<u8>,
+    guest_src_port: u16,
+}
+
 /// DNS cache TTL (seconds).  DNS responses carry their own TTL but parsing
 /// every record type is overkill — a short blanket TTL covers 99 % of cases
 /// while keeping the implementation simple.
@@ -69,6 +75,7 @@ pub const GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x01];
 const MTU: usize = 1500;
 const MAX_QUEUE_SIZE: usize = 64;
 const TCP_WINDOW: u16 = 65535;
+const MAX_TO_HOST_BUFFER: usize = 256 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────
 //  TCP NAT connection tracking
@@ -103,6 +110,10 @@ struct TcpNatEntry {
     guest_ack: u32,
     /// Data received from host, pending delivery to guest
     to_guest: Vec<u8>,
+    /// Data received from guest, pending write to host (buffered on EAGAIN)
+    to_host: Vec<u8>,
+    /// Guest sequence number to ACK once `to_host` is flushed
+    to_host_pending_ack: Option<u32>,
     last_activity: Instant,
 }
 
@@ -247,6 +258,8 @@ pub struct SlirpStack {
     dns_servers: Vec<String>,
     /// DNS response cache keyed by the raw query bytes (question section)
     dns_cache: HashMap<Vec<u8>, DnsCacheEntry>,
+    /// DNS queries waiting to be resolved on the net-poll thread.
+    pending_dns: Vec<PendingDnsQuery>,
 }
 
 impl SlirpStack {
@@ -315,6 +328,7 @@ impl SlirpStack {
             deny_list,
             dns_servers,
             dns_cache: HashMap::new(),
+            pending_dns: Vec::new(),
         })
     }
 
@@ -387,10 +401,13 @@ impl SlirpStack {
         let mut dev = VirtualDevice::new(self.queue.clone());
         let changed = self.iface.poll(ts, &mut dev, &mut self.sockets);
 
-        // 2. Process TCP NAT data relay
+        // 2. Resolve pending DNS queries (off vCPU thread)
+        self.resolve_pending_dns();
+
+        // 3. Process TCP NAT data relay
         self.relay_tcp_nat_data();
 
-        // 3. Collect frames: smoltcp ARP responses + our NAT-built frames
+        // 4. Collect frames: smoltcp ARP responses + our NAT-built frames
         let mut frames = Vec::new();
         {
             let mut q = self.queue.lock().unwrap();
@@ -436,6 +453,33 @@ impl SlirpStack {
             return None;
         }
         Some(query[12..pos].to_vec())
+    }
+
+    /// Drains the pending DNS queue and resolves each query. Called from
+    /// `poll()` on the net-poll thread, never from a vCPU thread.
+    fn resolve_pending_dns(&mut self) {
+        if self.pending_dns.is_empty() {
+            return;
+        }
+        let queries: Vec<PendingDnsQuery> = self.pending_dns.drain(..).collect();
+        for pending in queries {
+            if let Some(response) = self.forward_dns_query(&pending.query) {
+                let frame = self.build_udp_response(
+                    SLIRP_DNS_IP,
+                    SLIRP_GUEST_IP,
+                    53,
+                    pending.guest_src_port,
+                    &response,
+                );
+                self.inject_to_guest.push(frame);
+                debug!(
+                    "SLIRP DNS: resolved pending query, {} byte response",
+                    response.len()
+                );
+            } else {
+                warn!("SLIRP DNS: failed to resolve pending query");
+            }
+        }
     }
 
     /// Forward a DNS query to host resolvers and return the response.
@@ -611,21 +655,32 @@ impl SlirpStack {
             query.len()
         );
 
-        // Forward to host DNS
-        if let Some(response) = self.forward_dns_query(query) {
-            // Build response: Ethernet(IP(UDP(dns_response)))
-            let frame = self.build_udp_response(
-                SLIRP_DNS_IP,   // src = DNS server
-                SLIRP_GUEST_IP, // dst = guest
-                53,             // src port
-                src_port,       // dst port
-                &response,
-            );
-            self.inject_to_guest.push(frame);
-            debug!("SLIRP DNS: sent {} byte response", response.len());
-        } else {
-            warn!("SLIRP DNS: failed to resolve query");
+        // Fast path: serve from cache (safe on vCPU thread)
+        if let Some(key) = Self::dns_cache_key(query) {
+            if let Some(entry) = self.dns_cache.get(&key) {
+                if Instant::now() < entry.expires {
+                    let mut resp = entry.response.clone();
+                    if resp.len() >= 2 && query.len() >= 2 {
+                        resp[0] = query[0];
+                        resp[1] = query[1];
+                    }
+                    debug!("SLIRP DNS: cache hit (vCPU fast path)");
+                    let frame =
+                        self.build_udp_response(SLIRP_DNS_IP, SLIRP_GUEST_IP, 53, src_port, &resp);
+                    self.inject_to_guest.push(frame);
+                    return Ok(());
+                } else {
+                    self.dns_cache.remove(&key);
+                }
+            }
         }
+
+        // Slow path: queue for resolution on net-poll thread
+        debug!("SLIRP DNS: queuing for async resolution");
+        self.pending_dns.push(PendingDnsQuery {
+            query: query.to_vec(),
+            guest_src_port: src_port,
+        });
         Ok(())
     }
 
@@ -739,6 +794,8 @@ impl SlirpStack {
                         our_seq,
                         guest_ack: seq + 1,
                         to_guest: Vec::new(),
+                        to_host: Vec::new(),
+                        to_host_pending_ack: None,
                         last_activity: Instant::now(),
                     };
                     self.tcp_nat.insert(key.clone(), entry);
@@ -807,29 +864,49 @@ impl SlirpStack {
             );
         }
 
-        // Data payload
         let payload = tcp.payload();
         if !payload.is_empty() && entry.state == TcpNatState::Established {
-            // Forward to host
-            match entry.host_stream.write_all(payload) {
-                Ok(()) => {
-                    entry.guest_ack = seq.wrapping_add(payload.len() as u32);
-                    let ack_frame = build_tcp_packet_static(
-                        dst_ip,
-                        SLIRP_GUEST_IP,
-                        dst_port,
-                        src_port,
-                        entry.our_seq,
-                        entry.guest_ack,
-                        TcpControl::None,
-                        &[],
-                    );
-                    self.inject_to_guest.push(ack_frame);
+            let new_ack = seq.wrapping_add(payload.len() as u32);
+
+            if entry.to_host.is_empty() {
+                match entry.host_stream.write(payload) {
+                    Ok(n) if n == payload.len() => {
+                        entry.guest_ack = new_ack;
+                        let ack_frame = build_tcp_packet_static(
+                            dst_ip,
+                            SLIRP_GUEST_IP,
+                            dst_port,
+                            src_port,
+                            entry.our_seq,
+                            entry.guest_ack,
+                            TcpControl::None,
+                            &[],
+                        );
+                        self.inject_to_guest.push(ack_frame);
+                    }
+                    Ok(n) => {
+                        entry.to_host.extend_from_slice(&payload[n..]);
+                        entry.to_host_pending_ack = Some(new_ack);
+                        entry.guest_ack = seq.wrapping_add(n as u32);
+                        entry.last_activity = Instant::now();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        entry.to_host.extend_from_slice(payload);
+                        entry.to_host_pending_ack = Some(new_ack);
+                        entry.last_activity = Instant::now();
+                    }
+                    Err(e) => {
+                        warn!("SLIRP TCP: write to host failed: {}", e);
+                        entry.state = TcpNatState::Closed;
+                    }
                 }
-                Err(e) => {
-                    warn!("SLIRP TCP: write to host failed: {}", e);
-                    entry.state = TcpNatState::Closed;
-                }
+            } else if entry.to_host.len() + payload.len() <= MAX_TO_HOST_BUFFER {
+                entry.to_host.extend_from_slice(payload);
+                entry.to_host_pending_ack = Some(new_ack);
+                entry.last_activity = Instant::now();
+            } else {
+                warn!("SLIRP TCP: to_host buffer full, dropping connection");
+                entry.state = TcpNatState::Closed;
             }
         }
 
@@ -867,7 +944,6 @@ impl SlirpStack {
         // Collect frames to inject (built separately to avoid borrow issues)
         let mut frames_to_inject: Vec<Vec<u8>> = Vec::new();
 
-        // Phase 1: Read from host, update state, build frames
         for (key, entry) in self.tcp_nat.iter_mut() {
             if entry.state == TcpNatState::Closed {
                 to_remove.push(key.clone());
@@ -879,6 +955,37 @@ impl SlirpStack {
             }
             if entry.state != TcpNatState::Established {
                 continue;
+            }
+
+            if !entry.to_host.is_empty() {
+                match entry.host_stream.write(&entry.to_host) {
+                    Ok(n) => {
+                        entry.to_host.drain(..n);
+                        entry.last_activity = Instant::now();
+                        if entry.to_host.is_empty() {
+                            if let Some(ack) = entry.to_host_pending_ack.take() {
+                                entry.guest_ack = ack;
+                                let ack_frame = build_tcp_packet_static(
+                                    key.dst_ip,
+                                    SLIRP_GUEST_IP,
+                                    key.dst_port,
+                                    key.guest_src_port,
+                                    entry.our_seq,
+                                    entry.guest_ack,
+                                    TcpControl::None,
+                                    &[],
+                                );
+                                frames_to_inject.push(ack_frame);
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        warn!("SLIRP TCP: buffered write to host failed: {}", e);
+                        entry.state = TcpNatState::Closed;
+                        continue;
+                    }
+                }
             }
 
             // Read from host
@@ -1119,10 +1226,50 @@ mod tests {
 
     #[test]
     fn test_ipv4_checksum() {
-        // All zeros (except version/ihl) should produce a valid checksum
         let mut header = [0u8; 20];
         header[0] = 0x45;
         let cksum = ipv4_checksum(&header);
         assert_ne!(cksum, 0);
+    }
+
+    #[test]
+    fn test_to_host_buffer_limit() {
+        assert_eq!(MAX_TO_HOST_BUFFER, 256 * 1024);
+    }
+
+    #[test]
+    fn test_tcp_nat_entry_has_write_buffer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        stream.set_nonblocking(true).ok();
+
+        let entry = TcpNatEntry {
+            host_stream: stream,
+            state: TcpNatState::Established,
+            our_seq: 1000,
+            guest_ack: 2000,
+            to_guest: Vec::new(),
+            to_host: Vec::new(),
+            to_host_pending_ack: None,
+            last_activity: Instant::now(),
+        };
+
+        assert!(entry.to_host.is_empty());
+        assert!(entry.to_host_pending_ack.is_none());
+    }
+
+    #[test]
+    fn test_to_host_buffer_rejects_over_limit() {
+        let existing = vec![0u8; MAX_TO_HOST_BUFFER];
+        let new_payload = [0u8; 1];
+        assert!(existing.len() + new_payload.len() > MAX_TO_HOST_BUFFER);
+
+        let small_existing = vec![0u8; MAX_TO_HOST_BUFFER - 10];
+        let fits = [0u8; 10];
+        assert!(small_existing.len() + fits.len() <= MAX_TO_HOST_BUFFER);
+
+        let overflows = [0u8; 11];
+        assert!(small_existing.len() + overflows.len() > MAX_TO_HOST_BUFFER);
     }
 }

@@ -1,3 +1,4 @@
+mod attach;
 mod backend;
 mod banner;
 mod cli_config;
@@ -136,6 +137,62 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:43100")]
         listen: String,
     },
+
+    /// Attach an interactive PTY to a running VM.
+    Attach {
+        /// Run ID of the target VM.
+        #[arg(long)]
+        run_id: String,
+        /// Program to run (default: sh).
+        #[arg(long, default_value = "sh")]
+        program: String,
+        /// Arguments to the program.
+        #[arg(long)]
+        args: Vec<String>,
+        /// Working directory inside the guest.
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Daemon URL override.
+        #[arg(long)]
+        daemon: Option<String>,
+    },
+
+    /// Boot an ephemeral VM and open an interactive shell.
+    Shell {
+        /// Spec file (optional; generates ephemeral spec if omitted).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Program to run in the PTY.
+        #[arg(long, default_value = "claude")]
+        program: String,
+        /// Arguments to the program.
+        #[arg(long)]
+        args: Vec<String>,
+        /// Working directory inside the guest.
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Guest memory in MB.
+        #[arg(long, default_value = "1024")]
+        memory_mb: usize,
+        /// Number of vCPUs.
+        #[arg(long, default_value = "2")]
+        vcpus: usize,
+        /// Enable guest networking.
+        #[arg(long, default_value = "true")]
+        network: bool,
+        /// LLM provider override.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restore from snapshot.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Mount host directory (HOST:GUEST[:ro|rw], repeatable).
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
+        /// Set guest env var (KEY=VALUE, repeatable).
+        #[arg(long = "env")]
+        env_vars: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -181,7 +238,8 @@ fn resolved_daemon_url(command: &Command, config: &ResolvedConfig) -> String {
     match command {
         Command::Status { daemon, .. }
         | Command::Logs { daemon, .. }
-        | Command::Tui { daemon, .. } => {
+        | Command::Tui { daemon, .. }
+        | Command::Attach { daemon, .. } => {
             daemon.clone().unwrap_or_else(|| config.daemon_url.clone())
         }
         _ => config.daemon_url.clone(),
@@ -226,6 +284,45 @@ async fn run(
         Command::Config { command } => cmd_config(command, output, config).map(|_| 0),
         Command::Version => cmd_version(output).map(|_| 0),
         Command::Serve { listen } => cmd_serve(&listen).await.map(|_| 0),
+        Command::Attach {
+            run_id,
+            program,
+            args,
+            working_dir,
+            daemon,
+            ..
+        } => {
+            let url = daemon.unwrap_or_else(|| config.daemon_url.clone());
+            attach::cmd_attach(&run_id, Some(&program), &args, working_dir.as_deref(), &url).await
+        }
+        Command::Shell {
+            file,
+            program,
+            args,
+            working_dir,
+            memory_mb,
+            vcpus,
+            network,
+            provider,
+            snapshot,
+            mounts,
+            env_vars,
+        } => {
+            attach::cmd_shell(attach::ShellOpts {
+                file: file.as_deref(),
+                program: &program,
+                args: &args,
+                working_dir: working_dir.as_deref(),
+                memory_mb,
+                vcpus,
+                network,
+                provider: provider.as_deref(),
+                snapshot: snapshot.as_deref(),
+                mounts: &mounts,
+                env_vars: &env_vars,
+            })
+            .await
+        }
     }
 }
 
