@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive PTY shell handling on macOS/VZ: poll-based host relay, resize forwarding, and cleaner terminal lifecycle for Claude and other TUI-style programs
 - Guest console routing semantics are now consistent across macOS/VZ and Linux/KVM
 
+### Fixed
+- Snapshot restore: capture/restore `IA32_XSS` MSR to prevent XRSTORS #GP on CET-enabled kernels (6.x+)
+
 ## [0.1.2] - 2026-03-16
 
 ### Added
