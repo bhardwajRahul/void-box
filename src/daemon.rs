@@ -478,11 +478,20 @@ fn build_artifact_publication(
                     // Non-orchestration run with non-JSON output — skip validation
                     continue;
                 }
+                // Preserve raw artifact evidence even though structured
+                // validation failed: operators still need download access.
+                manifest.push(ArtifactManifestEntry {
+                    name: "result.json".to_string(),
+                    stage: stage.clone(),
+                    media_type: "application/octet-stream".to_string(),
+                    size_bytes: Some(data.len() as u64),
+                    retrieval_path: format!("/v1/runs/{}/stages/{}/output-file", run_id, stage),
+                });
                 return (
                     ArtifactPublication {
                         status: ArtifactPublicationStatus::Failed,
-                        published_at: None,
-                        manifest: Vec::new(),
+                        published_at: Some(now_rfc3339()),
+                        manifest,
                     },
                     Some(PublicationFailureReason::StructuredOutputMalformed(
                         format!("result.json for stage '{}' is not valid JSON", stage),
@@ -496,11 +505,20 @@ fn build_artifact_publication(
                 // Non-orchestration run with JSON missing status — skip validation
                 continue;
             }
+            // Preserve raw artifact evidence: the bytes are valid JSON,
+            // just structurally wrong. Operators still need download access.
+            manifest.push(ArtifactManifestEntry {
+                name: "result.json".to_string(),
+                stage: stage.clone(),
+                media_type: "application/json".to_string(),
+                size_bytes: Some(data.len() as u64),
+                retrieval_path: format!("/v1/runs/{}/stages/{}/output-file", run_id, stage),
+            });
             return (
                 ArtifactPublication {
                     status: ArtifactPublicationStatus::Failed,
-                    published_at: None,
-                    manifest: Vec::new(),
+                    published_at: Some(now_rfc3339()),
+                    manifest,
                 },
                 Some(PublicationFailureReason::StructuredOutputMalformed(
                     format!(
@@ -2349,30 +2367,13 @@ async fn get_stage_output_file(
         }
     };
 
-    // Validate structured output: must be valid JSON with a "status" field
-    match serde_json::from_slice::<serde_json::Value>(&data) {
-        Ok(val) => {
-            if val.get("status").is_none() {
-                return as_json((
-                    "422 Unprocessable Entity".to_string(),
-                    ApiError::structured_output_malformed(format!(
-                        "result.json for run '{}' stage '{}' is missing required 'status' field",
-                        run_id, stage_name
-                    ))
-                    .to_json(),
-                ));
-            }
-            ("200 OK".to_string(), "application/json".to_string(), data)
-        }
-        Err(_) => as_json((
-            "422 Unprocessable Entity".to_string(),
-            ApiError::structured_output_malformed(format!(
-                "result.json for run '{}' stage '{}' is not valid JSON",
-                run_id, stage_name
-            ))
-            .to_json(),
-        )),
-    }
+    // Serve raw bytes regardless of structural validity; validation lives in
+    // `build_artifact_publication` and surfaces via `artifact_publication.status`.
+    let media_type = match serde_json::from_slice::<serde_json::Value>(&data) {
+        Ok(_) => "application/json".to_string(),
+        Err(_) => "application/octet-stream".to_string(),
+    };
+    ("200 OK".to_string(), media_type, data)
 }
 
 fn kind_name(kind: &RunKind) -> &'static str {

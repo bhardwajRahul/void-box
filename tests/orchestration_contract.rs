@@ -972,6 +972,77 @@ workflow:
 }
 
 #[test]
+fn malformed_result_json_preserves_raw_artifact() {
+    let addr = start_daemon();
+    let spec = write_temp_spec(
+        "structured-output-malformed",
+        r#"api_version: v1
+kind: workflow
+name: structured-output-malformed
+
+sandbox:
+  mode: mock
+  network: false
+
+workflow:
+  steps:
+    - name: produce
+      run:
+        program: sh
+        args:
+          - -lc
+          - |
+            cat > /workspace/result.json <<'JSON'
+            {"summary":"missing status field on purpose"}
+            JSON
+  output_step: produce
+"#,
+    );
+
+    let (status, body) = http_request(
+        addr,
+        "POST",
+        "/v1/runs",
+        &format!(r#"{{"file":"{spec}","run_id":"workflow-malformed-output"}}"#),
+    );
+    assert_eq!(status, 200, "body={body}");
+
+    let run = wait_until_terminal(addr, "workflow-malformed-output", 5_000);
+
+    assert_eq!(run["status"], "failed", "run={run}");
+    assert_eq!(
+        run["artifact_publication"]["status"], "failed",
+        "publication should record failure: run={run}"
+    );
+
+    let manifest = run["artifact_publication"]["manifest"]
+        .as_array()
+        .expect("manifest array");
+    assert!(
+        manifest.iter().any(|entry| entry["name"] == "result.json"),
+        "manifest should still list result.json: manifest={manifest:?}"
+    );
+
+    let (status_output, body_output) = http_request_raw(
+        addr,
+        "GET",
+        "/v1/runs/workflow-malformed-output/stages/produce/output-file",
+        "",
+    );
+    assert_eq!(
+        status_output,
+        200,
+        "raw output-file should serve bytes even when validation failed: body={}",
+        String::from_utf8_lossy(&body_output)
+    );
+    assert!(
+        String::from_utf8_lossy(&body_output).contains("missing status field on purpose"),
+        "body should contain the original raw payload: body={}",
+        String::from_utf8_lossy(&body_output)
+    );
+}
+
+#[test]
 fn multi_step_workflow_without_result_json_still_succeeds() {
     let addr = start_daemon();
     let spec = write_temp_spec(

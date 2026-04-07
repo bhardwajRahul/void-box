@@ -40,6 +40,27 @@ use crate::{Error, Result};
 /// vsock port used by the guest agent.
 pub const GUEST_AGENT_PORT: u32 = 1234;
 
+/// Default read timeout for exec responses when the caller does not specify one.
+///
+/// LLM inference (especially with local models via Ollama on CPU) can take
+/// 10+ minutes per turn for complex prompts with tool definitions.
+const DEFAULT_EXEC_READ_TIMEOUT: Duration = Duration::from_secs(1200);
+
+/// Resolve the read timeout for an exec request.
+///
+/// Service mode passes `Some(0)` to mean "wait forever" (no timeout). Any other
+/// `Some(n)` is taken literally; `None` falls back to [`DEFAULT_EXEC_READ_TIMEOUT`].
+/// Returning `None` instructs [`GuestStream::set_read_timeout`] to disable the
+/// timeout entirely (blocking reads), instead of installing a zero-second timeout
+/// that some socket impls reject as `EINVAL` or interpret as non-blocking.
+fn resolve_exec_read_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
+    match timeout_secs {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(DEFAULT_EXEC_READ_TIMEOUT),
+    }
+}
+
 /// A stream to the guest agent that supports `Read`, `Write`, and timeout control.
 ///
 /// Both AF_VSOCK sockets (Linux) and VZ socket connections (macOS) expose
@@ -91,10 +112,7 @@ impl ControlChannel {
         let session_secret = self.session_secret;
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
 
-        let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1200));
+        let timeout = resolve_exec_read_timeout(request.timeout_secs);
         let msg_bytes = Message {
             msg_type: MessageType::ExecRequest,
             payload: serde_json::to_vec(request)?,
@@ -110,7 +128,7 @@ impl ControlChannel {
                 "exec",
             )?;
 
-            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_read_timeout(timeout);
             stream
                 .write_all(&msg_bytes)
                 .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
@@ -155,10 +173,7 @@ impl ControlChannel {
         let session_secret = self.session_secret;
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
 
-        let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1200));
+        let timeout = resolve_exec_read_timeout(request.timeout_secs);
         let msg_bytes = Message {
             msg_type: MessageType::ExecRequest,
             payload: serde_json::to_vec(request)?,
@@ -175,7 +190,7 @@ impl ControlChannel {
                 "exec-streaming",
             )?;
 
-            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_read_timeout(timeout);
             stream
                 .write_all(&msg_bytes)
                 .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
@@ -227,10 +242,7 @@ impl ControlChannel {
         let session_secret = self.session_secret;
         let boot_wait_done = Arc::clone(&self.boot_wait_done);
 
-        let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1200));
+        let timeout = resolve_exec_read_timeout(request.timeout_secs);
         let msg_bytes = Message {
             msg_type: MessageType::ExecRequest,
             payload: serde_json::to_vec(request)?,
@@ -246,7 +258,7 @@ impl ControlChannel {
                 "exec-streaming",
             )?;
 
-            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_read_timeout(timeout);
             stream
                 .write_all(&msg_bytes)
                 .map_err(|e| Error::Guest(format!("Failed to send request: {}", e)))?;
