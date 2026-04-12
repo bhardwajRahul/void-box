@@ -141,8 +141,8 @@ name = "e2e_sidecar"
 path = "tests/e2e/sidecar.rs"
 
 [[test]]
-name = "e2e_claude_mcp"
-path = "tests/e2e/claude_mcp.rs"
+name = "e2e_agent_mcp"
+path = "tests/e2e/agent_mcp.rs"
 
 [[test]]
 name = "orchestration_contract"
@@ -159,6 +159,10 @@ path = "tests/e2e/service_mode.rs"
 [[test]]
 name = "oci_integration"
 path = "tests/oci_integration.rs"
+
+[[test]]
+name = "observe_codex"
+path = "tests/observe_codex.rs"
 
 [workspace]
 members = ["guest-agent", "void-box-protocol", "claudio", "voidbox-oci", "void-message", "void-mcp"]

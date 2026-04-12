@@ -663,7 +663,7 @@ cargo test --test e2e_mount -- --ignored --test-threads=1
 # Service mode + sidecar + MCP e2e suites:
 cargo test --test e2e_service_mode -- --ignored --test-threads=1
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
-ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
 ### Test initramfs and BusyBox
@@ -781,7 +781,7 @@ cargo test --test e2e_mount -- --ignored --test-threads=1
 # Service mode + sidecar + MCP e2e suites (Linux-only):
 cargo test --test e2e_service_mode -- --ignored --test-threads=1
 cargo test --test e2e_sidecar -- --ignored --test-threads=1
-ANTHROPIC_API_KEY=... cargo test --test e2e_claude_mcp -- --ignored --test-threads=1
+ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
 macOS (VZ):
@@ -801,7 +801,7 @@ cargo test --release --test snapshot_vz_integration -- --ignored --test-threads=
 ```
 
 `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_service_mode`, `e2e_sidecar`, and
-`e2e_claude_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
+`e2e_agent_mcp` are Linux-only (`cfg(target_os = "linux")`) and are not expected
 to run on macOS.
 
 ### Interactive PTY / shell validation
@@ -836,7 +836,7 @@ OpenClaw gateway must run on the production image:
 
 ```bash
 TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 ```
 
 Then validate gateway workflow:
@@ -892,7 +892,7 @@ OpenClaw Telegram gateway (production path):
 ```bash
 TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 export ANTHROPIC_API_KEY=...
@@ -904,7 +904,7 @@ OpenClaw Telegram gateway with host Ollama (production path):
 ```bash
 TMPDIR=$PWD/target/tmp scripts/build_claude_rootfs.sh
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=$PWD/target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 export OLLAMA_BASE_URL=http://10.0.2.2:11434
@@ -931,7 +931,7 @@ cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 cargo test --test e2e_mount -- --ignored --test-threads=1
 ```
 
-Do **not** use `target/void-box-rootfs.cpio.gz` for these deterministic e2e suites.
+Do **not** use `target/void-box-claude.cpio.gz` or `target/void-box-codex.cpio.gz` for these deterministic e2e suites.
 That production image is for real Claude/OpenClaw runtime paths.
 `e2e_telemetry` and `e2e_skill_pipeline` are Linux/KVM only.
 `e2e_mount` runs on both Linux (KVM, virtio-9p) and macOS (VZ, virtiofs).
@@ -1053,9 +1053,11 @@ unpack failures, check for bare `?` on `entry.path()`, `entry.link_name()`, or
   daemon service lifecycle, or `ServiceStageHandle`.
 - `e2e_sidecar`: sidecar intent flow — submit, inbox polling, context identity,
   idempotency. **Must pass** for changes to sidecar state, types, or server.
-- `e2e_claude_mcp`: end-to-end Claude Code with void-mcp tools inside a real VM.
-  Requires `ANTHROPIC_API_KEY`. **Must pass** for changes to void-mcp tools or
-  MCP provisioning.
+- `e2e_agent_mcp`: end-to-end agent (currently Claude Code) with void-mcp
+  tools inside a real VM. void-mcp itself is agent-agnostic; the test
+  uses Claude as the consumer because it's the only LlmProvider wired to
+  consume MCP today. Requires `ANTHROPIC_API_KEY`. **Must pass** for
+  changes to void-mcp tools or MCP provisioning.
 
 If the environment lacks usable KVM/vsock or outbound network, VM suites should print skip reasons (for example `failed to create KVM VM: Permission denied`) rather than panic/fail.
 
@@ -1067,17 +1069,38 @@ If the environment lacks usable KVM/vsock or outbound network, VM suites should 
 - Does not require bundling production Claude runtime.
 - Preferred for general development and most integration tests.
 
-`scripts/build_claude_rootfs.sh`:
+@docs/agents/claude.md
 
-- Production Claude-capable rootfs/initramfs.
-- Includes native `claude-code`, CA certs, and sandbox user.
-- Use when validating production-like Claude execution paths.
-- Required for OpenClaw Telegram gateway example runs.
+@docs/agents/codex.md
 
 Recommended default:
 
 - Use `build_guest_image.sh` for broad test cycles.
-- Use `build_claude_rootfs.sh` for production gateway/runtime validation.
+- Use `build_claude_rootfs.sh` for production Claude gateway/runtime validation.
+- Use `build_codex_rootfs.sh` for Codex CLI workflows.
+
+### Development image paths
+
+Each build script writes to a **distinct default output path** so multiple
+flavors can coexist without overwriting each other. Set `OUT_CPIO` to
+override.
+
+| Script | Default output | Env var to use |
+|---|---|---|
+| `build_guest_image.sh` | `/tmp/void-box-rootfs.cpio.gz` | `VOID_BOX_INITRAMFS=/tmp/void-box-rootfs.cpio.gz` |
+| `build_test_image.sh` | `/tmp/void-box-test-rootfs.cpio.gz` | `VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz` |
+| `build_claude_rootfs.sh` | `target/void-box-claude.cpio.gz` | `VOID_BOX_INITRAMFS=$PWD/target/void-box-claude.cpio.gz` |
+| `build_codex_rootfs.sh` | `target/void-box-codex.cpio.gz` | `VOID_BOX_INITRAMFS=$PWD/target/void-box-codex.cpio.gz` |
+
+Which image for which test suite:
+
+| Test suite | Image needed |
+|---|---|
+| `cargo test --workspace` (unit tests) | None (no VM) |
+| `conformance`, `oci_integration` | `build_guest_image.sh` → `/tmp/void-box-rootfs.cpio.gz` |
+| `snapshot_integration`, `e2e_telemetry`, `e2e_skill_pipeline`, `e2e_mount`, `e2e_service_mode`, `e2e_sidecar` | `build_test_image.sh` → `/tmp/void-box-test-rootfs.cpio.gz` |
+| `e2e_agent_mcp` (real Claude + MCP) | `build_claude_rootfs.sh` → `target/void-box-claude.cpio.gz` |
+| Codex e2e (manual gate) | `build_codex_rootfs.sh` → `target/void-box-codex.cpio.gz` |
 
 ## VM memory sizing
 

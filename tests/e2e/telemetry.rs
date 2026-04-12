@@ -27,7 +27,7 @@ use std::sync::Arc;
 #[path = "../common/vm_preflight.rs"]
 mod vm_preflight;
 
-use void_box::observe::claude::{parse_stream_json, ClaudeExecOpts};
+use void_box::observe::claude::{parse_stream_json, AgentExecOpts};
 use void_box::observe::tracer::{SpanContext, Tracer, TracerConfig};
 use void_box::sandbox::Sandbox;
 use void_box::vmm::config::VoidBoxConfig;
@@ -164,7 +164,7 @@ fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
 async fn run_claudio(
     sandbox: &Sandbox,
     prompt: &str,
-) -> void_box::observe::claude::ClaudeExecResult {
+) -> void_box::observe::claude::AgentExecResult {
     let output = sandbox
         .exec(
             "claude-code",
@@ -184,13 +184,13 @@ async fn run_claudio(
 }
 
 // ===========================================================================
-// Test 1: Default scenario -- parsing, spans, and exec_claude (single VM)
+// Test 1: Default scenario -- parsing, spans, and exec_agent (single VM)
 // ===========================================================================
 
 /// Boot ONE VM and run multiple checks on the default (simple) scenario:
 ///  - stream-json parsing correctness
 ///  - OTel span creation from result
-///  - exec_claude() high-level wrapper
+///  - exec_agent() high-level wrapper
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_default_scenario() {
@@ -272,30 +272,31 @@ async fn test_default_scenario() {
     }
     eprintln!("  [B] OTel spans created correctly");
 
-    // --- C) exec_claude() high-level wrapper ---
-    let opts = ClaudeExecOpts {
+    // --- C) exec_agent() high-level wrapper ---
+    let opts = AgentExecOpts {
         dangerously_skip_permissions: true,
         ..Default::default()
     };
-    match sandbox.exec_claude("exec_claude test", opts).await {
+    let provider = void_box::llm::LlmProvider::Claude;
+    match sandbox.exec_agent(&provider, "exec_agent test", opts).await {
         Ok(result2) => {
-            assert!(!result2.is_error, "exec_claude should not error");
+            assert!(!result2.is_error, "exec_agent should not error");
             assert!(
                 !result2.session_id.is_empty(),
-                "exec_claude should have session_id"
+                "exec_agent should have session_id"
             );
             assert!(
                 !result2.tool_calls.is_empty(),
-                "exec_claude should have tool calls"
+                "exec_agent should have tool calls"
             );
-            eprintln!("  [C] exec_claude() works correctly");
+            eprintln!("  [C] exec_agent() works correctly");
         }
         Err(void_box::Error::Guest(msg))
             if msg.contains("guest does not have `claude-code` in PATH") =>
         {
-            eprintln!("  [C] skipped exec_claude() check: {}", msg);
+            eprintln!("  [C] skipped exec_agent() check: {}", msg);
         }
-        Err(e) => panic!("exec_claude failed: {e}"),
+        Err(e) => panic!("exec_agent failed: {e}"),
     }
 
     // Note: we don't call sandbox.stop() -- vCPU threads are blocked in KVM_RUN

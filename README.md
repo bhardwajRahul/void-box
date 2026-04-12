@@ -37,7 +37,7 @@
   Local-first. Cloud-ready. Runs on any Linux host with <code>/dev/kvm</code>.
 </p>
 
-> **Status:** v0 (early release). Production-ready architecture; APIs are still stabilizing.
+> **Status:** v0.1. Vendor-neutral agent runtime with hardware-isolated execution. APIs stabilizing.
 
 <p align="center">
   <img src="site/assets/img/hn_demo.gif" alt="hn_demo — two-stage stock analysis pipeline" width="800">
@@ -51,7 +51,7 @@
 - **Policy-enforced runtime** — Command allowlists, resource limits, seccomp-BPF, and controlled network egress.
 - **Skill-native model** — MCP servers, SKILL files, and CLI tools mounted as declared capabilities.
 - **Composable pipelines** — Sequential `.pipe()`, parallel `.fan_out()`, with explicit stage-level failure domains.
-- **Claude Code native runtime** — Each stage runs `claude-code`, backed by Claude or Ollama via provider mode.
+- **Vendor-neutral agent runtime** — Bring your own agent: Claude Code, OpenAI Codex, Ollama, LM Studio, or any Anthropic-compatible endpoint. The `llm.provider` field selects the agent binary and auth — void-box handles the isolation, not the model choice.
 - **OCI-native** — Auto-pulls guest images from GHCR; mount container images as base OS or skill providers.
 - **Observability native** — OTLP traces, metrics, structured logs, and stage-level telemetry emitted by design.
 - **Persistent host mounts** — Share host directories into guest VMs via 9p/virtiofs with read-only or read-write mode.
@@ -135,13 +135,24 @@ sandbox:
   memory_mb: 1024
   network: true
 llm:
-  provider: claude
+  provider: claude        # or: codex, claude-personal, ollama, lm-studio, custom
 agent:
   prompt: "Your task…"
   skills:
     - "file:examples/hackernews/skills/hackernews-api.md"
   timeout_secs: 600
 ```
+
+Supported `llm.provider` values:
+
+| Provider | Agent binary | Auth | Build script |
+|---|---|---|---|
+| `claude` | `claude-code` | `ANTHROPIC_API_KEY` | `scripts/build_claude_rootfs.sh` |
+| `claude-personal` | `claude-code` | Host `~/.claude` OAuth credentials | `scripts/build_claude_rootfs.sh` |
+| `codex` | `codex` | Host `~/.codex/auth.json` (ChatGPT login) or `OPENAI_API_KEY` | `scripts/build_codex_rootfs.sh` |
+| `ollama` | `claude-code` | Ollama on host (via SLIRP gateway) | `scripts/build_claude_rootfs.sh` |
+| `lm-studio` | `claude-code` | LM Studio on host (via SLIRP gateway) | `scripts/build_claude_rootfs.sh` |
+| `custom` | `claude-code` | Custom `ANTHROPIC_BASE_URL` | `scripts/build_claude_rootfs.sh` |
 
 ### Using the Rust library
 
@@ -211,7 +222,6 @@ VoidBox is evolving toward a durable, capability-bound execution platform.
 
 - **Session persistence** — Durable run/session state with pluggable backends (filesystem, SQLite, Valkey).
 - **Terminal-native interactive experience** — Panel-based, live-streaming interface powered by the event API.
-- **Codex-style backend support** — Optional execution backend for code-first workflows.
 - **Language bindings** — Python and Node.js SDKs for daemon-level integration.
 
 ## License

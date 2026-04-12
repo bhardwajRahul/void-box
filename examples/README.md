@@ -80,7 +80,7 @@ Then set runtime image env:
 
 ```bash
 export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-export VOID_BOX_INITRAMFS=target/void-box-rootfs.cpio.gz
+export VOID_BOX_INITRAMFS=target/void-box-claude.cpio.gz
 ```
 
 Run the HackerNews agent spec (Claude default):
@@ -139,6 +139,7 @@ Reference spec files for the `voidbox run --file` CLI:
 | `pipeline.yaml` | pipeline | Two-stage analyst → writer pipeline |
 | `workflow.yaml` | workflow | Shell-step workflow with `depends_on` |
 | `smoke_test.yaml` | agent | Quick "Hello from void-box!" smoke test |
+| `codex_workflow_smoke.yaml` | workflow | Single-step workflow that runs `codex --version` inside the guest VM. Verifies the bundled codex CLI binary is reachable and allowlisted. Build the initramfs with `CODEX_VERSION=0.118.0 scripts/build_codex_rootfs.sh`. |
 
 ```bash
 cargo run --bin voidbox -- run --file examples/specs/smoke_test.yaml

@@ -303,6 +303,7 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "bash",
     "claude-code",
     "claude",
+    "codex",
     "python3",
     "pip",
     "git",
