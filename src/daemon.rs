@@ -88,6 +88,16 @@ struct AppendMessageRequest {
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_on_listener(listener).await
+}
+
+/// Serve the daemon on an already-bound listener.
+///
+/// Useful for tests that need to reserve a port before spawning the server:
+/// binding here (rather than reserving a port and re-binding later) closes the
+/// TOCTOU window where another process could claim the port in between.
+pub async fn serve_on_listener(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     let provider = provider_from_env();
     let initial_runs = provider.load_runs().unwrap_or_default();
 
@@ -98,7 +108,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         sidecar_handles: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     println!("[void-box] daemon listening on http://{}", addr);
 
     loop {
@@ -865,7 +875,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
 
     // Start sidecar if messaging is enabled
     if messaging_enabled {
-        let sidecar_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let sidecar_addr = crate::backend::guest_accessible_bind_addr(0);
         match crate::sidecar::start_sidecar(&run_id, &run_id, &run_id, vec![], sidecar_addr).await {
             Ok(handle) => {
                 state
@@ -957,7 +967,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                     // Inject sidecar URL as env var for void-message CLI
                     spec.sandbox.env.insert(
                         "VOID_SIDECAR_URL".to_string(),
-                        format!("http://10.0.2.2:{}", port),
+                        crate::backend::guest_host_url(port),
                     );
                     // Inject messaging skill (documents the CLI, not raw HTTP)
                     if let Some(ref mut agent) = spec.agent {
@@ -992,7 +1002,7 @@ async fn create_run(body: &str, state: AppState) -> (String, String) {
                             let mut mcp_env = std::collections::HashMap::new();
                             mcp_env.insert(
                                 "VOID_SIDECAR_URL".to_string(),
-                                format!("http://10.0.2.2:{}", port),
+                                crate::backend::guest_host_url(port),
                             );
                             agent.skills.push(crate::spec::SkillEntry::Mcp {
                                 command: "void-mcp".to_string(),

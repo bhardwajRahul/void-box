@@ -40,6 +40,22 @@ pub struct VzSnapshotMeta {
     pub network: bool,
     /// The VM's vsock CID.
     pub cid: u32,
+    /// Host wall-clock injected into the original boot cmdline.
+    pub boot_clock_secs: u64,
+    /// Config hash that produced this snapshot, when known. Mirrors the hash
+    /// encoded in the snapshot directory name and lets tooling validate that
+    /// a sidecar was not moved into the wrong slot.
+    #[serde(default)]
+    pub config_hash: Option<String>,
+    /// `VZGenericMachineIdentifier.dataRepresentation` captured at save time.
+    ///
+    /// Apple's `restoreMachineStateFromURL:` rejects the restore with
+    /// `VZErrorRestore` / "invalid argument" unless the `VZGenericPlatformConfiguration`
+    /// used at restore time carries the same machine identifier that was baked
+    /// into the save file. Snapshots written before this field existed cannot
+    /// be restored and must be recreated.
+    #[serde(default)]
+    pub machine_identifier: Option<Vec<u8>>,
 }
 
 impl VzSnapshotMeta {

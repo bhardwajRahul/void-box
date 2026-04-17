@@ -73,6 +73,7 @@ fn backend_config() -> Option<BackendConfig> {
             seccomp: false,
         },
         snapshot: None,
+        enable_snapshots: true,
     })
 }
 
@@ -161,10 +162,7 @@ async fn snapshot_vz_round_trip() {
     let secret: [u8; 32] = meta.session_secret.as_slice().try_into().unwrap();
     restore_cfg.security.session_secret = secret;
 
-    if let Err(e) = restored.start(restore_cfg).await {
-        eprintln!("[vz_snapshot] restore failed: {e}");
-        return;
-    }
+    restored.start(restore_cfg).await.expect("restore failed");
     let restore_time = restore_start.elapsed();
     eprintln!("[vz_snapshot] Restored in {:.1?}", restore_time);
     assert!(restored.is_running());
@@ -190,6 +188,138 @@ async fn snapshot_vz_round_trip() {
     eprintln!("  Restore:     {:>10.1?}", restore_time);
     eprintln!("  Speedup:     {:>10.1}x", speedup);
     eprintln!("==============================");
+}
+
+/// Cold-boot a VZ VM, create an auto-snapshot, and verify the restored VM can
+/// still execute commands without manual intervention.
+///
+/// Auto-snapshot semantics: save the live VM, stop it, restart from the saved
+/// state so the caller ends up running against the restored VM (matching the
+/// KVM backend). The post-snapshot exec below exercises the restored VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn auto_snapshot_vz_round_trip() {
+    let config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+
+    eprintln!("[vz_auto_snapshot] Booting VM...");
+    let mut backend = VzBackend::new();
+    if let Err(e) = backend.start(config).await {
+        eprintln!("[vz_auto_snapshot] start failed: {e}");
+        return;
+    }
+
+    let output = backend
+        .exec("echo", &["before-auto-snap"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed before auto-snapshot");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout_str().trim(), "before-auto-snap");
+
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    let config_hash = "vz-auto-snapshot-test-hash".to_string();
+    eprintln!(
+        "[vz_auto_snapshot] Creating auto-snapshot at {}...",
+        snap_dir.path().display()
+    );
+    backend
+        .create_auto_snapshot(snap_dir.path(), config_hash.clone())
+        .await
+        .expect("create_auto_snapshot failed");
+
+    let save_path = VzSnapshotMeta::save_file_path(snap_dir.path());
+    assert!(save_path.exists(), "vm.vzvmsave must exist after save step");
+    let meta = VzSnapshotMeta::load(snap_dir.path()).expect("load vz_meta.json");
+    assert_eq!(meta.config_hash.as_deref(), Some(config_hash.as_str()));
+    assert!(
+        meta.machine_identifier.is_some(),
+        "sidecar must carry the VZGenericMachineIdentifier for restore"
+    );
+
+    assert!(
+        backend.is_running(),
+        "backend should be running against the restored VM"
+    );
+    let output = backend
+        .exec("echo", &["after-auto-snap"], &[], &[], None, Some(30))
+        .await
+        .expect("exec failed after auto-snapshot restore");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout_str().trim(), "after-auto-snap");
+    backend.stop().await.expect("stop failed");
+}
+
+/// Regression for VZ restore device-set drift.
+///
+/// Saves with `network: false`, then restores with a caller `BackendConfig`
+/// whose `network: true`, `memory_mb`, and `vcpus` all differ from the saved
+/// values. The restore path should pull the device-affecting fields from the
+/// sidecar and accept the restore; without the reconciliation helper the
+/// reconstructed `VZVirtualMachineConfiguration` would carry an extra
+/// virtio-net device and Apple would reject with `VZErrorRestore` /
+/// "invalid argument".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macOS + VZ entitlements + kernel/initramfs artifacts"]
+async fn snapshot_vz_restore_overrides_drifting_config() {
+    let save_config = match backend_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
+            return;
+        }
+    };
+    assert!(!save_config.network, "save config must have network=false");
+
+    // Match the other VZ tests: if the runner can't cold-boot a VM at all
+    // (nested virtualization unavailable, missing entitlements, resource
+    // contention), skip cleanly rather than fail the build. The regression
+    // this test exists for lives on the restore path below — if the cold
+    // boot never succeeds, there is nothing to regress against.
+    let mut backend = VzBackend::new();
+    if let Err(e) = backend.start(save_config.clone()).await {
+        eprintln!("[vz_restore_drift] skipping: cold boot failed: {e}");
+        return;
+    }
+    backend
+        .exec("echo", &["pre"], &[], &[], None, Some(30))
+        .await
+        .expect("pre-save exec");
+
+    let snap_dir = tempfile::tempdir().expect("tempdir");
+    tokio::task::block_in_place(|| backend.create_snapshot(snap_dir.path()))
+        .expect("create_snapshot");
+    backend.stop().await.expect("stop");
+
+    let meta = VzSnapshotMeta::load(snap_dir.path()).expect("load sidecar");
+    assert!(!meta.network, "sidecar must record network=false");
+
+    // Restore with a config whose device-affecting fields all drift. The
+    // restore branch must override these from the sidecar — otherwise the
+    // reconstructed VZ config would have a virtio-net device that isn't in
+    // the save blob, and Apple would reject with VZErrorRestore.
+    let mut restore_cfg = save_config;
+    restore_cfg.snapshot = Some(snap_dir.path().to_path_buf());
+    restore_cfg.network = true;
+    restore_cfg.memory_mb = meta.memory_mb + 128;
+    restore_cfg.vcpus = meta.vcpus + 1;
+    restore_cfg.security.session_secret = meta.session_secret.as_slice().try_into().unwrap();
+
+    let mut restored = VzBackend::new();
+    restored
+        .start(restore_cfg)
+        .await
+        .expect("restore should succeed after overriding drifting fields");
+    let output = restored
+        .exec("echo", &["post"], &[], &[], None, Some(30))
+        .await
+        .expect("exec on restored VM");
+    assert_eq!(output.stdout_str().trim(), "post");
+    restored.stop().await.expect("stop restored");
 }
 
 // ---------------------------------------------------------------------------

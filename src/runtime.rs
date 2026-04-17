@@ -151,12 +151,21 @@ pub async fn run_spec_service(
         None
     };
 
+    // Stage provider credentials so service-mode runs behave the same way as
+    // task-mode agent runs.
+    let staged_creds = prepare_claude_personal(spec.llm.as_ref())?;
+    let staged_codex_creds = prepare_codex(spec.llm.as_ref());
+
     let mut builder = VoidBox::new(&spec.name)
         .prompt(&agent.prompt)
         .mode(AgentMode::Service);
 
     builder = apply_box_sandbox(builder, spec, guest.as_ref());
     builder = apply_box_llm(builder, spec.llm.as_ref());
+    builder = apply_codex_credential_mount(builder, staged_codex_creds.as_ref());
+    if let Some(ref staged) = staged_creds {
+        builder = builder.claude_credentials_host_path(&staged.host_path);
+    }
 
     if let Some(ref plan) = oci_rootfs_plan {
         builder = apply_oci_rootfs(builder, plan);
@@ -329,8 +338,10 @@ async fn run_agent(
     let mut builder = VoidBox::new(&spec.name).prompt(&agent.prompt);
     builder = apply_box_sandbox(builder, spec, guest.as_ref());
     builder = apply_box_llm(builder, spec.llm.as_ref());
-    builder = apply_credential_mount(builder, staged_creds.as_ref());
     builder = apply_codex_credential_mount(builder, staged_codex_creds.as_ref());
+    if let Some(ref staged) = staged_creds {
+        builder = builder.claude_credentials_host_path(&staged.host_path);
+    }
 
     // Wire OCI rootfs mount if resolved.
     if let Some(ref plan) = oci_rootfs_plan {
@@ -818,8 +829,10 @@ fn build_pipeline_box_with_io(
     builder = apply_box_sandbox(builder, spec, guest);
     builder = apply_box_overrides(builder, b.sandbox.as_ref(), spec);
     builder = apply_box_llm(builder, b.llm.as_ref().or(spec.llm.as_ref()));
-    builder = apply_credential_mount(builder, staged_creds);
     builder = apply_codex_credential_mount(builder, staged_codex_creds);
+    if let Some(staged) = staged_creds {
+        builder = builder.claude_credentials_host_path(&staged.host_path);
+    }
     for s in &b.skills {
         builder = builder.skill(parse_skill_entry(s)?);
     }
@@ -1127,34 +1140,33 @@ async fn resolve_oci_guest_image(image_ref: &str) -> Result<GuestFiles> {
     })
 }
 
+/// Resolve an opt-in snapshot argument, emitting a CLI-visible warning when
+/// it does not match any known snapshot.  `context` is interpolated into the
+/// warning (e.g. `"Snapshot"` or `"Per-box snapshot"`).
+fn resolve_optional_snapshot(hash: &str, context: &str) -> Option<PathBuf> {
+    if hash.is_empty() {
+        return None;
+    }
+    match crate::snapshot_store::resolve_snapshot_argument(hash) {
+        crate::snapshot_store::SnapshotResolution::Hash(p)
+        | crate::snapshot_store::SnapshotResolution::Literal(p) => Some(p),
+        crate::snapshot_store::SnapshotResolution::NotFound { hash_dir, .. } => {
+            eprintln!(
+                "[void-box] {context} '{hash}' not found (checked {} and literal path)",
+                hash_dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the snapshot path from the spec.
 ///
 /// Returns `Some(path)` only if the spec explicitly declares a snapshot.
 /// No auto-detection, no env var fallback — snapshots are off unless
 /// the user explicitly sets `sandbox.snapshot` in the spec.
 fn resolve_snapshot(spec: &RunSpec) -> Option<PathBuf> {
-    let hash = spec.sandbox.snapshot.as_deref()?;
-    if hash.is_empty() {
-        return None;
-    }
-    // Resolve hash prefix to a snapshot directory
-    let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
-    if crate::snapshot_store::snapshot_exists(&dir) {
-        Some(dir)
-    } else {
-        // Treat as a literal path
-        let path = PathBuf::from(hash);
-        if crate::snapshot_store::snapshot_exists(&path) {
-            Some(path)
-        } else {
-            eprintln!(
-                "[void-box] Snapshot '{}' not found (checked {} and literal path)",
-                hash,
-                dir.display()
-            );
-            None
-        }
-    }
+    resolve_optional_snapshot(spec.sandbox.snapshot.as_deref()?, "Snapshot")
 }
 
 /// Resolve per-box snapshot override, falling back to the top-level spec.
@@ -1162,24 +1174,11 @@ fn resolve_box_snapshot(
     box_override: Option<&BoxSandboxOverride>,
     spec: &RunSpec,
 ) -> Option<PathBuf> {
-    // Per-box override takes priority
     if let Some(ov) = box_override {
         if let Some(ref hash) = ov.snapshot {
-            if !hash.is_empty() {
-                let dir = crate::snapshot_store::snapshot_dir_for_hash(hash);
-                if crate::snapshot_store::snapshot_exists(&dir) {
-                    return Some(dir);
-                }
-                let path = PathBuf::from(hash);
-                if crate::snapshot_store::snapshot_exists(&path) {
-                    return Some(path);
-                }
-                eprintln!("[void-box] Per-box snapshot '{}' not found", hash);
-                return None;
-            }
+            return resolve_optional_snapshot(hash, "Per-box snapshot");
         }
     }
-    // Fall back to top-level spec
     resolve_snapshot(spec)
 }
 
@@ -1260,9 +1259,9 @@ fn apply_box_overrides(
 /// actual value from the host process environment. This lets YAML authors
 /// write `GITHUB_TOKEN: ""` to mean "inject from host".
 ///
-/// For `OLLAMA_BASE_URL`, host env overrides the spec so macOS users can set
-/// `OLLAMA_BASE_URL=http://192.168.64.1:11434` (VZ NAT) instead of the default
-/// `10.0.2.2` (Linux SLIRP).
+/// `OLLAMA_BASE_URL` is treated specially: when the spec already provides a
+/// value, the host environment still wins. This supports guest workflows that
+/// talk directly to a host-local Ollama service while keeping the YAML checked in.
 fn resolve_env_value(key: &str, spec_value: &str) -> String {
     if spec_value.is_empty() {
         std::env::var(key).unwrap_or_default()
@@ -1291,10 +1290,9 @@ fn apply_box_llm(builder: VoidBox, llm: Option<&LlmSpec>) -> VoidBox {
             }
         }
         "custom" => {
-            let base_url = llm
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "http://10.0.2.2:11434".into());
+            let base_url = llm.base_url.clone().unwrap_or_else(|| {
+                format!("http://{}:11434", crate::backend::guest_host_gateway())
+            });
             let mut p = LlmProvider::custom(base_url);
             if let Some(model) = &llm.model {
                 p = p.model(model);
@@ -1347,8 +1345,10 @@ pub fn apply_llm_overrides_from_env(spec: &mut RunSpec) {
 
 /// If the LLM provider is `claude-personal`, discover and stage OAuth credentials.
 ///
-/// Returns `Some(StagedCredentials)` whose `host_path` should be mounted into
-/// the guest. The temp directory is cleaned up when the value is dropped.
+/// Returns `Some(StagedCredentials)` whose `host_path` is passed to
+/// `VoidBox::claude_credentials_host_path()` so `provision_claude_bootstrap`
+/// can read the credentials on the host and write them into the guest via the
+/// control channel. The temp directory is cleaned up when the value is dropped.
 fn prepare_claude_personal(llm: Option<&LlmSpec>) -> Result<Option<StagedCredentials>> {
     match llm {
         Some(l) if l.provider.eq_ignore_ascii_case("claude-personal") => {
@@ -1389,21 +1389,6 @@ fn prepare_codex(llm: Option<&LlmSpec>) -> Option<StagedCredentials> {
             );
             None
         }
-    }
-}
-
-/// If credentials were staged, inject a mount into the builder.
-///
-/// RW because Claude Code writes `settings.json` into `~/.claude/` at startup.
-/// Guest writes land in the host `TempDir`, which is ephemeral (cleaned up on drop).
-fn apply_credential_mount(builder: VoidBox, staged: Option<&StagedCredentials>) -> VoidBox {
-    match staged {
-        Some(s) => builder.mount(MountConfig {
-            host_path: s.host_path.clone(),
-            guest_path: "/home/sandbox/.claude".into(),
-            read_only: false,
-        }),
-        None => builder,
     }
 }
 

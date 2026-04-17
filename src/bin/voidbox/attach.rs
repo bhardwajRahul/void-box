@@ -1,6 +1,6 @@
 //! CLI handlers for `voidbox attach` and `voidbox shell`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::termios::tcgetwinsize;
 use tracing::info;
@@ -115,6 +115,7 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
     let mut auto_snapshot_pending = false;
 
     if opts.auto_snapshot {
+        builder = builder.enable_snapshots(true);
         let config_hash = compute_config_hash(
             Path::new(&kernel),
             initramfs.as_deref().map(Path::new),
@@ -132,10 +133,10 @@ pub async fn cmd_shell(opts: ShellOpts<'_>) -> Result<i32, Box<dyn std::error::E
             );
             auto_snapshot_pending = true;
         }
-    } else if let Some(snapshot_path) = opts.snapshot {
-        builder = builder.snapshot(snapshot_path);
-    } else if let Some(ref snapshot_path) = run_spec.sandbox.snapshot {
-        builder = builder.snapshot(snapshot_path);
+    } else if let Some(snapshot_arg) = opts.snapshot {
+        builder = builder.snapshot(resolve_snapshot_arg(snapshot_arg)?);
+    } else if let Some(ref snapshot_arg) = run_spec.sandbox.snapshot {
+        builder = builder.snapshot(resolve_snapshot_arg(snapshot_arg)?);
     }
 
     for mount_spec in &run_spec.sandbox.mounts {
@@ -419,6 +420,26 @@ fn parse_mount_flag(raw: &str) -> Result<MountConfig, Box<dyn std::error::Error>
         guest_path: parts[1].to_string(),
         read_only,
     })
+}
+
+/// Resolves a `--snapshot` argument (or spec-level `sandbox.snapshot`) to an
+/// absolute snapshot directory.
+///
+/// Thin wrapper over [`void_box::snapshot_store::resolve_snapshot_argument`]
+/// that turns the shared resolution result into a CLI-friendly error.
+fn resolve_snapshot_arg(arg: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match void_box::snapshot_store::resolve_snapshot_argument(arg) {
+        void_box::snapshot_store::SnapshotResolution::Hash(p)
+        | void_box::snapshot_store::SnapshotResolution::Literal(p) => Ok(p),
+        void_box::snapshot_store::SnapshotResolution::NotFound { hash_dir, literal } => {
+            Err(format!(
+                "snapshot '{arg}' not found (checked {} and literal path '{}')",
+                hash_dir.display(),
+                literal.display()
+            )
+            .into())
+        }
+    }
 }
 
 /// Parses a `KEY=VALUE` env flag.

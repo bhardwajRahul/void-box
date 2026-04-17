@@ -18,21 +18,21 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+#[path = "common/net.rs"]
+mod test_net;
+
 /// Start the daemon on a random port and return the address.
 fn start_daemon() -> SocketAddr {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = std::net::TcpListener::bind(addr).unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let addr = local_addr;
+    let (addr, listener) = test_net::reserve_localhost_listener();
+    listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Set state dir to temp to avoid polluting real state
             let dir = tempfile::tempdir().unwrap();
             std::env::set_var("VOIDBOX_STATE_DIR", dir.path());
-            let _ = void_box::daemon::serve(addr).await;
+            let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = void_box::daemon::serve_on_listener(tokio_listener).await;
         });
     });
 

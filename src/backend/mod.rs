@@ -18,6 +18,7 @@ pub mod kvm;
 pub mod vz;
 
 use std::io::{Read, Seek, SeekFrom};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,6 +37,17 @@ use crate::ExecOutput;
 /// places it in guest RAM) and the decompressed tmpfs content coexist during
 /// early-boot extraction, so the caller adds both on top of this constant.
 const INITRAMFS_OVERHEAD_BYTES: u64 = 208 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_GUEST_HOST_GATEWAY: &str = "10.0.2.2";
+#[cfg(target_os = "macos")]
+const MACOS_GUEST_HOST_GATEWAY: &str = "192.168.64.1";
+
+fn session_secret_hex(session_secret: &[u8; 32]) -> String {
+    session_secret
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
 
 /// A single host→guest directory mount.
 #[derive(Debug, Clone)]
@@ -98,6 +110,13 @@ pub struct BackendConfig {
     /// Path to a snapshot directory to restore from (skips cold boot).
     /// If `None`, the VM is cold-booted normally.
     pub snapshot: Option<PathBuf>,
+    /// Opt-in that the caller intends to save a snapshot later in this run.
+    ///
+    /// Backends that require upfront save/restore capability validation (VZ
+    /// on macOS) use this to decide whether to run that check at cold-boot
+    /// time.  Restore path implies it; auto-snapshot callers set it
+    /// explicitly.
+    pub enable_snapshots: bool,
 }
 
 impl BackendConfig {
@@ -136,6 +155,7 @@ impl BackendConfig {
                 seccomp: false,
             },
             snapshot: None,
+            enable_snapshots: false,
         }
     }
 
@@ -193,6 +213,93 @@ impl BackendConfig {
     }
 }
 
+/// Append guest-visible kernel command line arguments shared by KVM and VZ.
+///
+/// The caller owns the platform-specific prefix (console device, virtio
+/// discovery, rootfs device wiring). This helper appends the common suffix:
+/// session secret, boot clock, optional guest networking flags, mount
+/// descriptors, and OCI rootfs selectors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_common_guest_kernel_args(
+    cmdline_parts: &mut Vec<String>,
+    session_secret: &[u8; 32],
+    epoch_secs: u64,
+    network_enabled: bool,
+    include_guest_network_flag: bool,
+    mounts: &[MountConfig],
+    oci_rootfs: Option<&str>,
+    oci_rootfs_dev: Option<&str>,
+) {
+    cmdline_parts.push(format!(
+        "voidbox.secret={}",
+        session_secret_hex(session_secret)
+    ));
+    cmdline_parts.push(format!("voidbox.clock={}", epoch_secs));
+
+    if network_enabled {
+        if include_guest_network_flag {
+            cmdline_parts.push("voidbox.network=1".to_string());
+        }
+        cmdline_parts.push("ipv6.disable=1".to_string());
+    }
+
+    for (mount_index, mount) in mounts.iter().enumerate() {
+        let mount_mode = if mount.read_only { "ro" } else { "rw" };
+        cmdline_parts.push(format!(
+            "voidbox.mount{}=mount{}:{}:{}",
+            mount_index, mount_index, mount.guest_path, mount_mode
+        ));
+    }
+
+    if let Some(oci_rootfs_path) = oci_rootfs {
+        cmdline_parts.push(format!("voidbox.oci_rootfs={}", oci_rootfs_path));
+    }
+
+    if let Some(oci_rootfs_device) = oci_rootfs_dev {
+        cmdline_parts.push(format!("voidbox.oci_rootfs_dev={}", oci_rootfs_device));
+    }
+}
+
+/// Host-reachable gateway address as seen from inside the guest VM.
+///
+/// Linux/KVM uses the userspace SLIRP gateway, while macOS/VZ uses the
+/// Virtualization.framework NAT gateway.
+pub fn guest_host_gateway() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        LINUX_GUEST_HOST_GATEWAY
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MACOS_GUEST_HOST_GATEWAY
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        "127.0.0.1"
+    }
+}
+
+/// Build a guest-visible HTTP URL to a host-local service.
+pub fn guest_host_url(port: u16) -> String {
+    format!("http://{}:{}", guest_host_gateway(), port)
+}
+
+/// Bind address for host-side services that must be reachable from inside the guest.
+///
+/// On Linux/KVM, SLIRP forwards guest connections to host loopback. On macOS/VZ,
+/// host services must listen on a non-loopback interface to be reachable through
+/// the NAT gateway.
+pub fn guest_accessible_bind_addr(port: u16) -> SocketAddr {
+    #[cfg(target_os = "macos")]
+    {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+}
+
 /// Security-relevant settings for the backend.
 #[derive(Debug, Clone)]
 pub struct BackendSecurityConfig {
@@ -208,6 +315,43 @@ pub struct BackendSecurityConfig {
     pub max_concurrent_connections: usize,
     /// Whether to install seccomp-bpf (Linux only, ignored on macOS).
     pub seccomp: bool,
+}
+
+/// Absolute guest path where the network deny list is materialized for
+/// backends that enforce filtering in-guest (VZ on macOS — Apple's NAT has
+/// no host-side filter hook). Linux/KVM enforces deny-list CIDRs in the
+/// host-side SLIRP stack and does not need this file.
+pub const GUEST_NETWORK_DENY_LIST_PATH: &str = "/etc/voidbox/network_deny_list.json";
+
+/// Minimal host→guest write surface used to materialize policy files in the
+/// guest without going through [`VmmBackend`].
+///
+/// Separated from `VmmBackend` so helpers like
+/// [`provision_network_deny_list_with_writer`] can be exercised from unit
+/// tests against a fake writer, avoiding the cost of booting a real VM.
+#[async_trait::async_trait]
+pub trait GuestPolicyWriter: Sync {
+    async fn mkdir_p(&self, path: &str) -> Result<()>;
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+}
+
+/// Write the network deny list to the guest in JSON form at
+/// [`GUEST_NETWORK_DENY_LIST_PATH`].  No-ops when the deny list is empty.
+pub async fn provision_network_deny_list_with_writer(
+    writer: &dyn GuestPolicyWriter,
+    deny_list: &[String],
+) -> Result<()> {
+    if deny_list.is_empty() {
+        return Ok(());
+    }
+
+    let deny_list_json = serde_json::to_string_pretty(deny_list).map_err(|e| {
+        crate::Error::Config(format!("failed to serialize network deny list: {}", e))
+    })?;
+    writer.mkdir_p("/etc/voidbox").await?;
+    writer
+        .write_file(GUEST_NETWORK_DENY_LIST_PATH, deny_list_json.as_bytes())
+        .await
 }
 
 /// Trait that all VM backends must implement.
