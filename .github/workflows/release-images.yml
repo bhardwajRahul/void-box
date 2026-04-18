@@ -6,6 +6,12 @@ name: Release Images
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build images for (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write  # Attach assets to release
@@ -29,6 +35,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -121,7 +129,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
           cd target
           # Upload all image artifacts and their checksums
           for f in \
