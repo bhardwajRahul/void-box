@@ -63,12 +63,23 @@ jobs:
           ./scripts/build_release_artifacts.sh ${{ github.ref_name }} ${{ matrix.arch }}
 
       - name: Install nfpm
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NFPM_VERSION=2.45.1
           NFPM_ARCH="${{ matrix.nfpm_arch }}"
-          curl -sfL --retry 5 --retry-delay 10 --retry-all-errors \
-            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz" \
-            -o /tmp/nfpm.tar.gz
+          ASSET="nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
+          for attempt in 1 2 3 4 5; do
+            if gh release download "v${NFPM_VERSION}" \
+                 --repo goreleaser/nfpm \
+                 --pattern "$ASSET" \
+                 --output /tmp/nfpm.tar.gz; then
+              break
+            fi
+            echo "nfpm download attempt $attempt failed; sleeping 15s"
+            sleep 15
+          done
+          test -s /tmp/nfpm.tar.gz
           tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
 
       - name: Build .deb package
@@ -117,7 +128,14 @@ jobs:
 
       - name: Install musl cross-compiler
         run: |
-          brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          for attempt in 1 2 3 4 5; do
+            if brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl; then
+              break
+            fi
+            echo "brew install attempt $attempt failed; sleeping 30s"
+            sleep 30
+          done
+          command -v aarch64-unknown-linux-musl-gcc
 
       - name: Build voidbox host binary
         run: |
