@@ -434,17 +434,62 @@ VoidBox supports three types of VM snapshots for sub-second restore. All snapsho
 
 ### Performance
 
-Measured on Linux/KVM with 256 MB RAM, 1 vCPU, userspace virtio-vsock:
+Two different latencies matter for snapshot/restore — the **host-side
+snapshot/restore phase** (just the function call) and the **end-to-end
+user-perceived startup** (from `Sandbox::build()` through first exec
+round-trip). The second is what users actually wait for.
+
+**Host-side phase times** — measured on Linux/KVM with 256 MB RAM,
+1 vCPU, userspace virtio-vsock:
 
 | Phase | Time | Notes |
 |---|---|---|
-| Cold boot | ~10 ms | |
 | Base snapshot | ~420 ms | Full 256 MB memory dump |
 | Base restore | ~1.3 ms | COW mmap, lazy page loading |
 | Diff snapshot | ~270 ms | Only dirty pages (~1.5 MB, 0.6% of RAM) |
 | Diff restore | ~3 ms | Base COW mmap + dirty page overlay |
-| **Base speedup** | **~8x** | Cold boot / base restore |
 | **Diff savings** | **99.4%** | Memory file size reduction |
+
+**End-to-end startup (time-to-first-exec)** — measured via
+`voidbox-startup-bench --iters 20 --breakdown` on Fedora 43 / KVM,
+1 GiB RAM, slim kernel (`scripts/build_slim_kernel.sh`) + test rootfs
+(`scripts/build_test_image.sh`):
+
+| Path | p50 | p95 | Notes |
+|---|---|---|---|
+| Cold boot → first exec | **252 ms** | 259 ms | Kernel boot + vsock handshake + one exec RTT |
+| Warm restore → first exec | **138 ms** | 144 ms | `from_snapshot` (sub-ms) + handshake + one exec RTT |
+
+The warm path dwarfs the ~1.3 ms host-side restore because the guest
+kernel resumes from HLT/NOHZ-idle and the host-side vsock handshake
+retry loop converges only as fast as the guest-agent replies to Ping.
+Decomposition of both paths (and the path to sub-100 ms cold) lives
+in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
+
+**Startup evolution on this runtime** — where the 19× cold speedup came from:
+
+| Stage | Cold p50 | Warm p50 | What landed |
+|-------|----------|----------|-------------|
+| Baseline (pre-`feat/perf`) | ~4.9 s | ~607 ms | Blind `sleep(4s)` pre-handshake, blind `sleep(1s)` after module load, 200 ms `epoll_wait` on vsock-irq |
+| After blind-wait removal | 3.5 s | 433 ms | Poll `connect()` directly, drop guest-agent module-load sleep, tighten vsock-irq epoll to 20 ms |
+| After `initcall_blacklist` | 1.7 s | 140 ms | Skip distro-kernel `cmos_init` / `i8042_init` probe timeouts via default kernel cmdline |
+| **After slim kernel** (current) | **252 ms** | **138 ms** | Upstream Linux v6.12.30 + Firecracker microvm config + 9p/virtiofs/overlayfs, uncompressed `vmlinux` |
+
+**Comparison with other microVM runtimes** — approximate published numbers,
+measurement methodology varies (Firecracker's published number is
+"guest init complete", ours is "first exec RTT over vsock"):
+
+| Runtime | Cold boot | Warm restore | Notes |
+|---------|-----------|--------------|-------|
+| Firecracker (AWS) | ~125 ms | <50 ms (snapshot) | Minimal microVM, ~5 years of optimization, purpose-built for Lambda |
+| libkrun (Red Hat) | ~100–150 ms | — | Container-focused, very lean |
+| cloud-hypervisor | ~100–250 ms | 100–200 ms | More features than Firecracker |
+| QEMU microvm | ~300–500 ms | — | Best-case QEMU config |
+| **VoidBox (this branch)** | **252 ms** | **138 ms** | Kernel boot + vsock handshake + first exec RTT |
+
+Competitive for a general-purpose agent runtime; behind Firecracker's
+Lambda-specialized numbers. Paths to narrow the gap further are documented
+in `docs/superpowers/plans/2026-04-19-startup-push-to-sub-100ms.md`.
 
 ### Storage layout
 
