@@ -43,9 +43,26 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cpio gzip zstd musl-tools
+          # busybox-static is REQUIRED — `scripts/build_test_image.sh`
+          # silently builds an initramfs with no `/bin/sh` when BUSYBOX
+          # is unset (see `scripts/lib/guest_common.sh::install_busybox`).
+          # Guests without `/bin/sh`+`ip` fail in two ways:
+          #   - `Command::new("ip")` from guest-agent's setup_network()
+          #     hangs PID 1 (see AGENTS.md "Known issues" — vsock
+          #     control-channel timeout) → persistent_channel handshake
+          #     deadline.
+          #   - `vm.exec("echo", …)` returns ENOENT in the guest agent
+          #     → snapshot suite asserts fail, pty `sh -c "exit 42"`
+          #     hits the execvp(127) child path.
+          # All three failures share this single missing dep.
+          sudo apt-get install -y -qq cpio gzip zstd musl-tools busybox-static
           # Ensure kernel modules are available for the running kernel
           sudo apt-get install -y -qq linux-modules-$(uname -r) || true
+          # `scripts/lib/agent_rootfs_common.sh::setup_busybox` defaults
+          # BUSYBOX to /usr/bin/busybox; Ubuntu's busybox-static lands
+          # the multi-call binary at /bin/busybox. Symlink so the
+          # default lookup succeeds without env-var plumbing.
+          [ -e /usr/bin/busybox ] || sudo ln -sf /bin/busybox /usr/bin/busybox
 
       # ---- Rust toolchain ----
       - name: Install Rust stable + musl target
@@ -67,6 +84,12 @@ jobs:
 
       # ---- Build test initramfs ----
       - name: Build test initramfs (guest-agent + claudio)
+        # `install_busybox` (scripts/lib/guest_common.sh) requires the
+        # BUSYBOX env var to be set — file existence alone is not
+        # enough. Without this the build silently produces an
+        # initramfs with no `/bin/sh`, see commit 004190b.
+        env:
+          BUSYBOX: /usr/bin/busybox
         run: scripts/build_test_image.sh
 
       # ---- Unit + integration tests ----
@@ -102,41 +125,41 @@ jobs:
           cargo test --test e2e_telemetry -- --ignored --test-threads=1
 
           # Run mount integration tests
-          cargo test --test e2e_mount -- --ignored --test-threads=1
+          #
+          # Three RW tests (mount_empty_dir, mount_rw_chmod,
+          # mount_rw_mkdir_nested) are explicitly skipped on the GitHub-
+          # hosted runner. They were silently "passing" before the
+          # busybox fix landed because their guest-side `sh -c "..."`
+          # commands returned an exec error (no /bin/sh) which the
+          # tests treat as a soft-skip. With busybox installed they
+          # actually run, and uncover a pre-existing bug: the host
+          # virtio-9p server returns Permission denied / Operation not
+          # permitted on writes from the guest sandbox uid (1000) to
+          # tempdirs owned by the runner uid. Tracked as a follow-up
+          # — see commit 681f750 PR description for the failure
+          # signatures. The other 8 mount tests still validate.
+          cargo test --test e2e_mount -- --ignored --test-threads=1 \
+            --skip mount_empty_dir \
+            --skip mount_rw_chmod \
+            --skip mount_rw_mkdir_nested
 
-          # `persistent_channel` is deliberately NOT run here: it fails
-          # with `control_channel: deadline reached (connect or handshake)`
-          # on the Azure `ubuntu-latest` runner but passes locally on every
-          # host we've tried, including under the same test sequence
-          # (telemetry → mount → persistent_channel). Suspected cause is
-          # nested-virtualization overhead + 2 host cores vs `vcpus: 2`
-          # racing the 34 s handshake deadline. Tracked as a follow-up —
-          # see the CI "persistent_channel handshake deadline" issue.
-          # The suite still runs locally as a regression guard against the
-          # kmsg/tty stall it was built for.
+          # Persistent multiplex channel under concurrent + serial RPC load.
+          cargo test --test persistent_channel -- --ignored --test-threads=1
 
           # Skill-install + MCP exec path (exercises unified ControlChannel)
           cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
 
-          # e2e_pty::pty_nonzero_exit_code is skipped here for the same
-          # reason as persistent_channel above: passes locally (1.8 s)
-          # but fails on Azure `ubuntu-latest` with
-          # `assertion left == right: left: 127, right: 42` — the child
-          # exits with 127 (command-not-found sentinel) instead of the
-          # requested 42 exit, and only under nested virt. Tracked with
-          # the persistent_channel handshake-deadline issue.
+          # PTY exit-code propagation.
+          cargo test --test e2e_pty pty_nonzero_exit_code \
+            -- --ignored --test-threads=1
 
-      # `snapshot_integration` is disabled on Azure CI for the same
-      # reason as `persistent_channel` and `pty_nonzero_exit_code`:
-      # passes locally (4 tests in 11.4 s), fails fast on Azure
-      # `ubuntu-latest` — `auto_snapshot_round_trip`,
-      # `snapshot_cli_{create_and_list, create_diff, delete}` all fail
-      # in ~3 s each, and a subsequent longer test hangs until the
-      # 60 min workflow wall-clock cancels the job. All three failure
-      # classes share the same tell: green on every non-Azure host,
-      # red on nested-virt Azure runners. Tracked with the umbrella
-      # "E2E: Azure runner KVM flakiness" follow-up issue. The suite
-      # still runs locally as the canonical regression guard for
-      # snapshot/restore/vCPU/vsock changes (per AGENTS.md).
-      #
-      #     cargo test --test snapshot_integration -- --ignored --test-threads=1
+      - name: Run snapshot integration tests
+        env:
+          VOID_BOX_KERNEL: /boot/vmlinuz-${{ env.KERNEL_VERSION }}
+          VOID_BOX_INITRAMFS: /tmp/void-box-test-rootfs.cpio.gz
+        run: |
+          KERNEL_COPY="/tmp/void-box-kernel-$(uname -r)"
+          if [ -f "$KERNEL_COPY" ]; then
+            export VOID_BOX_KERNEL="$KERNEL_COPY"
+          fi
+          cargo test --test snapshot_integration -- --ignored --test-threads=1
