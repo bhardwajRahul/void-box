@@ -1,4 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request as HyperRequest};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
+use hyperlocal::{UnixConnector, Uri as HyperLocalUri};
+
+/// Hyper client over `hyperlocal::UnixConnector`. The legacy client wraps a
+/// connection pool and request multiplexer over `Connection: keep-alive`,
+/// matching what the daemon serves on the same transport.
+type UnixHyperClient = HyperClient<UnixConnector, Full<Bytes>>;
 
 /// Errors from CLI backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -65,36 +78,222 @@ impl LocalBackend {
     }
 }
 
+/// Transport selected from the configured daemon URL.
+///
+/// `reqwest` does not ship a unix-socket connector, so the two paths use
+/// different HTTP stacks: TCP goes through `reqwest`, AF_UNIX goes through
+/// `hyper-util`'s legacy client over `hyperlocal::UnixConnector`. Both
+/// produce the same `/v1/...` wire format against the daemon's HTTP API,
+/// so callers above this layer don't observe the split.
+enum Transport {
+    Tcp {
+        base_url: String,
+        client: reqwest::Client,
+    },
+    Unix {
+        // Boxed because the hyper client struct is materially bigger than
+        // reqwest::Client; an unboxed field would unbalance the enum and
+        // trigger clippy::large_enum_variant.
+        client: Box<UnixHyperClient>,
+        socket_path: PathBuf,
+        #[allow(dead_code)]
+        display_url: String,
+    },
+}
+
+const UNIX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// HTTP client for the daemon: all remote CLI access goes through here.
 pub struct RemoteBackend {
+    #[allow(dead_code)]
     pub daemon_url: String,
-    client: reqwest::Client,
+    bearer_token: Option<String>,
+    transport: Transport,
 }
 
 impl RemoteBackend {
+    #[allow(dead_code)]
     pub fn new(daemon_url: String) -> Self {
+        Self::with_token(daemon_url, None)
+    }
+
+    pub fn with_token(daemon_url: String, bearer_token: Option<String>) -> Self {
+        let transport = Self::build_transport(&daemon_url);
         Self {
             daemon_url,
+            bearer_token,
+            transport,
+        }
+    }
+
+    fn build_transport(daemon_url: &str) -> Transport {
+        if let Some(rest) = daemon_url.strip_prefix("unix://") {
+            // Require an absolute path. Three slashes (`unix:///abs/path`)
+            // is the canonical Docker/curl/hyperlocal form; an authority
+            // segment (`unix://host/path`) has no meaning for AF_UNIX and
+            // would silently turn into a relative path here. Reject loudly.
+            if !rest.starts_with('/') {
+                panic!(
+                    "invalid daemon URL {daemon_url:?}: unix:// scheme requires an \
+                     absolute socket path (e.g. unix:///run/user/1000/voidbox.sock); \
+                     got {rest:?}"
+                );
+            }
+            let trimmed = rest.trim_end_matches('/');
+            let socket_path = PathBuf::from(trimmed);
+            let client = HyperClient::builder(TokioExecutor::new()).build(UnixConnector);
+            return Transport::Unix {
+                client: Box::new(client),
+                socket_path,
+                display_url: daemon_url.trim_end_matches('/').to_string(),
+            };
+        }
+        Transport::Tcp {
+            base_url: daemon_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
         }
     }
 
+    #[allow(dead_code)]
     fn base_url(&self) -> &str {
-        self.daemon_url.trim_end_matches('/')
+        match &self.transport {
+            Transport::Tcp { base_url, .. } => base_url.as_str(),
+            Transport::Unix { display_url, .. } => display_url.as_str(),
+        }
     }
 
-    async fn get_text(&self, url: &str) -> Result<String, BackendError> {
-        self.client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.to_string(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))
+    fn auth_header(&self) -> Option<(&str, &str)> {
+        self.bearer_token
+            .as_deref()
+            .map(|tok| ("authorization", tok))
+    }
+
+    /// Perform an HTTP request and return the response body and status. The
+    /// TCP path uses `reqwest`; the unix path uses `hyper-util`'s legacy
+    /// client over `hyperlocal::UnixConnector`. Both paths speak the same
+    /// `/v1/...` HTTP wire format that the daemon serves, so the returned
+    /// shape is identical regardless of transport.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, BackendError> {
+        match &self.transport {
+            Transport::Tcp { base_url, client } => {
+                let url = format!("{base_url}{path}");
+                let mut req = match method {
+                    "GET" => client.get(&url),
+                    "POST" => client.post(&url),
+                    "PUT" => client.put(&url),
+                    "DELETE" => client.delete(&url),
+                    other => {
+                        return Err(BackendError::DaemonError(format!(
+                            "unsupported method {other}"
+                        )))
+                    }
+                };
+                if let Some((k, v)) = self.auth_header() {
+                    req = req.header(k, format!("Bearer {v}"));
+                }
+                if let Some(ct) = content_type {
+                    req = req.header("content-type", ct);
+                }
+                if let Some(b) = body {
+                    req = req.body(b.to_string());
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| BackendError::DaemonUnreachable {
+                        url: url.clone(),
+                        detail: e.to_string(),
+                    })?;
+                let status = resp.status().as_u16();
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| BackendError::DaemonError(e.to_string()))?;
+                Ok(HttpResponse { status, body: text })
+            }
+            Transport::Unix {
+                client,
+                socket_path,
+                ..
+            } => {
+                self.send_unix(
+                    client.as_ref(),
+                    socket_path,
+                    method,
+                    path,
+                    body,
+                    content_type,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn send_unix(
+        &self,
+        client: &UnixHyperClient,
+        socket_path: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, BackendError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|e| BackendError::DaemonError(format!("unsupported method: {e}")))?;
+        let uri: hyper::Uri = HyperLocalUri::new(socket_path, path).into();
+
+        let mut builder = HyperRequest::builder().method(method).uri(uri);
+        if let Some((k, v)) = self.auth_header() {
+            builder = builder.header(k, format!("Bearer {v}"));
+        }
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+
+        let body_bytes = body
+            .map(|s| Bytes::copy_from_slice(s.as_bytes()))
+            .unwrap_or_default();
+        let request = builder
+            .body(Full::new(body_bytes))
+            .map_err(|e| BackendError::DaemonError(format!("build request: {e}")))?;
+
+        let display_url = format!("unix://{}", socket_path.display());
+        let send_fut = async {
+            let resp =
+                client
+                    .request(request)
+                    .await
+                    .map_err(|e| BackendError::DaemonUnreachable {
+                        url: display_url,
+                        detail: e.to_string(),
+                    })?;
+            let status = resp.status().as_u16();
+            let collected = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| BackendError::DaemonError(format!("read response body: {e}")))?;
+            let body = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+            Ok(HttpResponse { status, body })
+        };
+
+        match tokio::time::timeout(UNIX_HTTP_TIMEOUT, send_fut).await {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::DaemonError(
+                "unix socket request timed out".into(),
+            )),
+        }
+    }
+
+    async fn get_text(&self, path: &str) -> Result<String, BackendError> {
+        let resp = self.send("GET", path, None, None).await?;
+        Ok(resp.body)
     }
 
     /// Parse daemon JSON response bodies; empty body → `null`.
@@ -108,15 +307,15 @@ impl RemoteBackend {
 
     /// `GET /v1/runs/{run_id}/events` — run log stream.
     pub async fn logs(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}/events", self.base_url(), run_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/runs/{run_id}/events");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
     /// `GET /v1/runs/{run_id}` — run status.
     pub async fn status(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}", self.base_url(), run_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/runs/{run_id}");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
@@ -126,24 +325,11 @@ impl RemoteBackend {
         file: &str,
         input: Option<String>,
     ) -> Result<String, BackendError> {
-        let url = format!("{}/v1/runs", self.base_url());
         let body = serde_json::json!({ "file": file, "input": input }).to_string();
-        let text = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))?;
-
-        let value = serde_json::from_str::<serde_json::Value>(&text)
+        let resp = self
+            .send("POST", "/v1/runs", Some(&body), Some("application/json"))
+            .await?;
+        let value = serde_json::from_str::<serde_json::Value>(&resp.body)
             .map_err(|e| BackendError::DaemonError(format!("invalid JSON from daemon: {e}")))?;
         let run_id = value
             .get("run_id")
@@ -159,46 +345,34 @@ impl RemoteBackend {
         role: &str,
         content: &str,
     ) -> Result<(), BackendError> {
-        let url = format!("{}/v1/sessions/{}/messages", self.base_url(), session_id);
         let body = serde_json::json!({ "role": role, "content": content }).to_string();
-        self.client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?;
+        let path = format!("/v1/sessions/{session_id}/messages");
+        self.send("POST", &path, Some(&body), Some("application/json"))
+            .await?;
         Ok(())
     }
 
     /// `GET /v1/sessions/{session_id}/messages` — session message history.
     pub async fn get_messages(&self, session_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/sessions/{}/messages", self.base_url(), session_id);
-        let body = self.get_text(&url).await?;
+        let path = format!("/v1/sessions/{session_id}/messages");
+        let body = self.get_text(&path).await?;
         Self::parse_json_body(&body)
     }
 
     /// `POST /v1/runs/{run_id}/cancel` — cancel a run.
     pub async fn cancel_run(&self, run_id: &str) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/v1/runs/{}/cancel", self.base_url(), run_id);
-        let text = self
-            .client
-            .post(&url)
-            .body("{}")
-            .send()
-            .await
-            .map_err(|e| BackendError::DaemonUnreachable {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| BackendError::DaemonError(e.to_string()))?;
-        Self::parse_json_body(&text)
+        let path = format!("/v1/runs/{run_id}/cancel");
+        let resp = self
+            .send("POST", &path, Some("{}"), Some("application/json"))
+            .await?;
+        Self::parse_json_body(&resp.body)
     }
+}
+
+struct HttpResponse {
+    #[allow(dead_code)]
+    status: u16,
+    body: String,
 }
 
 #[cfg(test)]

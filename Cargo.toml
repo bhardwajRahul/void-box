@@ -35,6 +35,15 @@ opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_ex
 # HTTP client (for fetching remote skills from skills.sh)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
 futures-util = "0.3"
+# AF_UNIX HTTP transport for the CLI -> daemon path. `reqwest` has no
+# unix-socket transport; `hyperlocal` provides a `UnixConnector` for the
+# `hyper-util` legacy client. `hyper`/`hyper-util`/`http-body-util` are
+# already in the workspace dep tree (transitive via reqwest).
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+hyperlocal = "0.9"
+bytes = "1"
 
 # Security (cross-platform)
 getrandom = "0.3"
@@ -64,6 +73,7 @@ sha2 = "0.10"
 indicatif = "0.18"
 tempfile = "3"
 secrecy = { workspace = true }
+subtle = "2"
 
 # --- Linux-only dependencies ---
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -153,6 +163,18 @@ path = "tests/e2e/agent_mcp.rs"
 [[test]]
 name = "orchestration_contract"
 path = "tests/orchestration_contract.rs"
+
+[[test]]
+name = "daemon_unix_perms"
+path = "tests/daemon_unix_perms.rs"
+
+[[test]]
+name = "daemon_auth"
+path = "tests/daemon_auth.rs"
+
+[[test]]
+name = "daemon_unix_round_trip"
+path = "tests/daemon_unix_round_trip.rs"
 
 [[test]]
 name = "conformance"
