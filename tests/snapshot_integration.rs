@@ -5,24 +5,21 @@
 //! snapshot (stopping the VM), restores it, and compares cold-boot vs restore
 //! latency.
 //!
-//! Requirements (same as `kvm_integration.rs`):
-//! - `/dev/kvm` present and accessible
-//! - Environment variables:
-//!   - `VOID_BOX_KERNEL`    -> path to vmlinux or bzImage
-//!   - `VOID_BOX_INITRAMFS` -> path to initramfs (cpio.gz)
+//! Requires `/dev/kvm` present and accessible. Kernel and initramfs are
+//! auto-provisioned by [`test_artifacts`] under `--ignored`; `VOID_BOX_KERNEL`
+//! / `VOID_BOX_INITRAMFS` are optional overrides that skip the build. All VM
+//! tests are `#[ignore]`, so a plain `cargo test` never provisions or boots a
+//! VM.
 //!
 //! ```bash
-//! export VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r)
-//! export VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz
-//!
 //! cargo test --test snapshot_integration -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::vmm::config::{VoidBoxConfig, VsockBackendType};
 use void_box::vmm::snapshot::{self, SnapshotConfig, VmSnapshot};
@@ -33,37 +30,13 @@ use void_box::Error;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Load kernel + initramfs paths from environment.
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
-}
-
-/// Run preflight checks; returns `None` (with eprintln) if the environment
-/// is not suitable for KVM snapshot tests.
-fn preflight() -> Option<(PathBuf, Option<PathBuf>)> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping snapshot test: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping snapshot test: {e}");
-        return None;
-    }
-    let Some((kernel, initramfs)) = kvm_artifacts_from_env() else {
-        eprintln!(
-            "skipping snapshot test: \
-             set VOID_BOX_KERNEL and (optionally) VOID_BOX_INITRAMFS"
-        );
-        return None;
-    };
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping snapshot test: {e}");
-        return None;
-    }
-    Some((kernel, initramfs))
+/// Provision the kernel + initramfs this suite boots. Capability is not
+/// probed: these tests force the userspace vsock backend, so the host needs no
+/// `/dev/vhost-vsock`, and any VM-op error is a real failure that
+/// [`expect_capable`] surfaces.
+fn preflight() -> (PathBuf, Option<PathBuf>) {
+    let (kernel, initramfs) = test_artifacts::artifacts();
+    (kernel, Some(initramfs))
 }
 
 /// Test memory size in MB. Override with `VOID_BOX_TEST_MEMORY_MB` for the
@@ -73,16 +46,6 @@ fn test_memory_mb() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256)
-}
-
-/// Diagnostic mode for the Azure CI flakiness investigation. When `VOID_BOX_DIAGNOSTIC=1`
-/// is set, the snapshot tests stop swallowing VM-creation and exec errors via
-/// graceful early-return and instead panic with the full error chain so the
-/// failing step is visible in CI output. Off by default so the local runs that
-/// gracefully skip on missing KVM keep their existing behaviour.
-#[allow(dead_code)]
-pub(crate) fn diagnostic_mode() -> bool {
-    matches!(std::env::var("VOID_BOX_DIAGNOSTIC").as_deref(), Ok("1"))
 }
 
 /// Format an error and its `source()` chain, one cause per line.
@@ -102,24 +65,21 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// Helper used by the snapshot tests: under `diagnostic_mode()` it panics with
-/// the full error chain (top message + every `source()`), otherwise it just
-/// `eprintln!`s and returns `None` so the test gracefully ends. The
-/// macro-shaped name keeps call sites short.
+/// Unwrap a fallible VM op, or panic with the full error chain. Capability is
+/// not probed and artifacts are provisioned, so an error here is a real failure
+/// on a machine asked to run VM tests — never a skip.
 #[allow(dead_code)]
-pub(crate) fn diag_or_skip<T, E>(label: &str, result: Result<T, E>) -> Option<T>
+pub(crate) fn expect_capable<T, E>(label: &str, result: Result<T, E>) -> T
 where
     E: std::error::Error + 'static,
 {
     match result {
-        Ok(v) => Some(v),
+        Ok(v) => v,
         Err(e) => {
             let chain = format_error_chain(&e);
-            if diagnostic_mode() {
-                panic!("[{label}] failed under VOID_BOX_DIAGNOSTIC=1: {chain}");
-            }
-            eprintln!("  {label}: {chain}");
-            None
+            panic!(
+                "[{label}] VM operation failed on a capable machine (real failure, not a skip): {chain}"
+            );
         }
     }
 }
@@ -237,36 +197,23 @@ async fn try_restored_exec(vm: &MicroVm) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cold_boot_vs_restore() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot ---
     eprintln!("[cold_boot_vs_restore] Booting VM...");
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
-    };
+    let vm = expect_capable(
+        "[cold_boot_vs_restore] MicroVm::new",
+        MicroVm::new(cfg).await,
+    );
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(Error::VmNotRunning) => {
-            eprintln!("  VM not running after cold boot");
-            return;
-        }
-        Err(Error::Guest(msg)) => {
-            eprintln!("  guest communication error: {msg}");
-            return;
-        }
-        Err(e) => panic!("  exec failed: {e}"),
-    };
+    let output = expect_capable(
+        "[cold_boot_vs_restore] cold exec",
+        vm.exec("echo", &["ready"]).await,
+    );
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
     eprintln!(
@@ -284,16 +231,11 @@ async fn snapshot_cold_boot_vs_restore() {
 
     eprintln!("[cold_boot_vs_restore] Taking cold snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
-    };
+    let snapshot_path = expect_capable(
+        "[cold_boot_vs_restore] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config())
+            .await,
+    );
     let snap_time = snap_start.elapsed();
     eprintln!(
         "[cold_boot_vs_restore] Snapshot captured in {:.1?}",
@@ -330,13 +272,10 @@ async fn snapshot_cold_boot_vs_restore() {
     // --- Restore ---
     eprintln!("[cold_boot_vs_restore] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
-    };
+    let mut restored_vm = expect_capable(
+        "[cold_boot_vs_restore] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    );
     let restore_time = restore_start.elapsed();
     eprintln!(
         "[cold_boot_vs_restore] Restored VM CID={} (restore took {:.1?})",
@@ -404,29 +343,18 @@ async fn snapshot_cold_boot_vs_restore() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_diff_restore() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot ---
     eprintln!("[diff_restore] Booting VM...");
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
-    };
+    let vm = expect_capable("[diff_restore] MicroVm::new", MicroVm::new(cfg).await);
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
-    };
+    let output = expect_capable(
+        "[diff_restore] cold exec",
+        vm.exec("echo", &["ready"]).await,
+    );
     assert!(output.success());
     eprintln!("[diff_restore] Cold boot OK");
 
@@ -440,17 +368,11 @@ async fn snapshot_diff_restore() {
 
     eprintln!("[diff_restore] Taking base snapshot...");
     let base_snap_start = Instant::now();
-    let base_path = match vm
-        .snapshot(&base_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  base snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let base_path = expect_capable(
+        "[diff_restore] base snapshot",
+        vm.snapshot(&base_dir, config_hash.clone(), snap_config())
+            .await,
+    );
     let base_snap_time = base_snap_start.elapsed();
     eprintln!(
         "[diff_restore] Base snapshot captured in {:.1?}",
@@ -463,14 +385,10 @@ async fn snapshot_diff_restore() {
 
     // --- Restore from base ---
     eprintln!("[diff_restore] Restoring from base snapshot...");
-    let restored_vm = match MicroVm::from_snapshot(&base_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  base restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let restored_vm = expect_capable(
+        "[diff_restore] base from_snapshot",
+        MicroVm::from_snapshot(&base_path).await,
+    );
     eprintln!("[diff_restore] Restored VM CID={}", restored_vm.cid());
 
     // Enable dirty tracking BEFORE any exec — all guest activity must be
@@ -485,14 +403,10 @@ async fn snapshot_diff_restore() {
     assert!(exec_ok, "base-restored VM exec must succeed");
 
     // Run another command to dirty more guest pages
-    let output = match restored_vm.exec("echo", &["dirty-pages"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec after dirty tracking failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let output = expect_capable(
+        "[diff_restore] dirty exec",
+        restored_vm.exec("echo", &["dirty-pages"]).await,
+    );
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "dirty-pages");
     eprintln!("[diff_restore] Dirtied pages via exec");
@@ -503,22 +417,17 @@ async fn snapshot_diff_restore() {
 
     eprintln!("[diff_restore] Taking diff snapshot...");
     let diff_snap_start = Instant::now();
-    let diff_path = match restored_vm
-        .snapshot_diff(
-            diff_dir.path(),
-            config_hash.clone(),
-            snap_config(),
-            parent_id,
-        )
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  diff snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let diff_path = expect_capable(
+        "[diff_restore] snapshot_diff",
+        restored_vm
+            .snapshot_diff(
+                diff_dir.path(),
+                config_hash.clone(),
+                snap_config(),
+                parent_id,
+            )
+            .await,
+    );
     let diff_snap_time = diff_snap_start.elapsed();
     eprintln!(
         "[diff_restore] Diff snapshot captured in {:.1?}",
@@ -555,14 +464,10 @@ async fn snapshot_diff_restore() {
     // --- Restore from diff ---
     eprintln!("[diff_restore] Restoring from diff snapshot...");
     let diff_restore_start = Instant::now();
-    let mut diff_restored_vm = match MicroVm::from_snapshot(&diff_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  diff restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let mut diff_restored_vm = expect_capable(
+        "[diff_restore] diff from_snapshot",
+        MicroVm::from_snapshot(&diff_path).await,
+    );
     let diff_restore_time = diff_restore_start.elapsed();
     eprintln!(
         "[diff_restore] Diff-restored VM CID={} (restore took {:.1?})",
@@ -615,9 +520,7 @@ async fn snapshot_diff_restore() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_multi_vcpu() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
 
     let num_vcpus: usize = 4;
     let cfg = build_config_vcpus(&kernel, initramfs.as_deref(), num_vcpus);
@@ -625,23 +528,11 @@ async fn snapshot_multi_vcpu() {
     // --- Cold boot with 4 vCPUs ---
     eprintln!("[multi_vcpu] Booting VM with {} vCPUs...", num_vcpus);
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
-    };
+    let vm = expect_capable("[multi_vcpu] MicroVm::new", MicroVm::new(cfg).await);
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
-    };
+    let output = expect_capable("[multi_vcpu] cold exec", vm.exec("echo", &["ready"]).await);
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
     eprintln!(
@@ -656,16 +547,11 @@ async fn snapshot_multi_vcpu() {
 
     eprintln!("[multi_vcpu] Taking snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config_vcpus(num_vcpus))
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
-    };
+    let snapshot_path = expect_capable(
+        "[multi_vcpu] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config_vcpus(num_vcpus))
+            .await,
+    );
     let snap_time = snap_start.elapsed();
     eprintln!("[multi_vcpu] Snapshot captured in {:.1?}", snap_time);
 
@@ -708,13 +594,10 @@ async fn snapshot_multi_vcpu() {
     // --- Restore ---
     eprintln!("[multi_vcpu] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
-    };
+    let mut restored_vm = expect_capable(
+        "[multi_vcpu] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    );
     let restore_time = restore_start.elapsed();
     eprintln!(
         "[multi_vcpu] Restored VM CID={} (restore took {:.1?})",
@@ -763,43 +646,26 @@ async fn snapshot_multi_vcpu() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_net_restore() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config_net(&kernel, initramfs.as_deref());
 
     // --- Cold boot with networking ---
     eprintln!("[net_restore] Booting VM with networking...");
     let cold_start = Instant::now();
-    let vm = match MicroVm::new(cfg).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  failed to create VM: {e}");
-            return;
-        }
-    };
+    let vm = expect_capable("[net_restore] MicroVm::new", MicroVm::new(cfg).await);
     let cold_boot_time = cold_start.elapsed();
 
     // Health check
-    let output = match vm.exec("echo", &["ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  cold boot exec failed: {e}");
-            return;
-        }
-    };
+    let output = expect_capable("[net_restore] cold exec", vm.exec("echo", &["ready"]).await);
     assert!(output.success());
     assert_eq!(output.stdout_str().trim(), "ready");
     eprintln!("[net_restore] Cold boot OK ({:.1?})", cold_boot_time);
 
     // Verify networking works before snapshot
-    let net_check = match vm.exec("ip", &["link", "show", "eth0"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  net check failed: {e}");
-            return;
-        }
-    };
+    let net_check = expect_capable(
+        "[net_restore] pre-snapshot net check",
+        vm.exec("ip", &["link", "show", "eth0"]).await,
+    );
     eprintln!(
         "[net_restore] Pre-snapshot eth0: exit={}, stdout='{}'",
         net_check.exit_code,
@@ -814,16 +680,11 @@ async fn snapshot_net_restore() {
 
     eprintln!("[net_restore] Taking snapshot...");
     let snap_start = Instant::now();
-    let snapshot_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config_net())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
-    };
+    let snapshot_path = expect_capable(
+        "[net_restore] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config_net())
+            .await,
+    );
     let snap_time = snap_start.elapsed();
     eprintln!("[net_restore] Snapshot captured in {:.1?}", snap_time);
 
@@ -855,13 +716,10 @@ async fn snapshot_net_restore() {
     // --- Restore ---
     eprintln!("[net_restore] Restoring from snapshot...");
     let restore_start = Instant::now();
-    let mut restored_vm = match MicroVm::from_snapshot(&snapshot_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
-    };
+    let mut restored_vm = expect_capable(
+        "[net_restore] from_snapshot",
+        MicroVm::from_snapshot(&snapshot_path).await,
+    );
     let restore_time = restore_start.elapsed();
     eprintln!(
         "[net_restore] Restored VM CID={} (restore took {:.1?})",
@@ -948,22 +806,16 @@ fn snapshot_cli_list_empty() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_create_and_list() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot ---
     eprintln!("[cli_create_list] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_create_list] MicroVm::new", MicroVm::new(cfg).await) else {
-        return;
-    };
-    let Some(output) = diag_or_skip(
+    let vm = expect_capable("[cli_create_list] MicroVm::new", MicroVm::new(cfg).await);
+    let output = expect_capable(
         "[cli_create_list] vm.exec",
         vm.exec("echo", &["ready"]).await,
-    ) else {
-        return;
-    };
+    );
     assert!(
         output.success(),
         "[cli_create_list] exec returned exit={:?} stdout={:?} stderr={:?}",
@@ -982,17 +834,11 @@ async fn snapshot_cli_create_and_list() {
         "[cli_create_list] Taking snapshot (hash={})...",
         &config_hash[..16]
     );
-    match vm
-        .snapshot(&snap_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_create_list] snapshot",
+        vm.snapshot(&snap_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     // --- Verify list_snapshots() finds it ---
     let snapshots = snapshot::list_snapshots().expect("list_snapshots");
@@ -1025,20 +871,13 @@ async fn snapshot_cli_create_and_list() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_delete() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot ---
     eprintln!("[cli_delete] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_delete] MicroVm::new", MicroVm::new(cfg).await) else {
-        return;
-    };
-    let Some(output) = diag_or_skip("[cli_delete] vm.exec", vm.exec("echo", &["ready"]).await)
-    else {
-        return;
-    };
+    let vm = expect_capable("[cli_delete] MicroVm::new", MicroVm::new(cfg).await);
+    let output = expect_capable("[cli_delete] vm.exec", vm.exec("echo", &["ready"]).await);
     assert!(
         output.success(),
         "[cli_delete] exec returned exit={:?} stdout={:?} stderr={:?}",
@@ -1054,17 +893,11 @@ async fn snapshot_cli_delete() {
     std::fs::create_dir_all(&snap_dir).expect("create snapshot dir");
 
     eprintln!("[cli_delete] Taking snapshot...");
-    match vm
-        .snapshot(&snap_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_delete] snapshot",
+        vm.snapshot(&snap_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     // Verify it exists
     assert!(snap_dir.exists(), "snapshot dir must exist before delete");
@@ -1104,22 +937,16 @@ async fn snapshot_cli_delete() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn snapshot_cli_create_diff() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot & base snapshot ---
     eprintln!("[cli_create_diff] Booting VM...");
-    let Some(vm) = diag_or_skip("[cli_create_diff] MicroVm::new", MicroVm::new(cfg).await) else {
-        return;
-    };
-    let Some(output) = diag_or_skip(
+    let vm = expect_capable("[cli_create_diff] MicroVm::new", MicroVm::new(cfg).await);
+    let output = expect_capable(
         "[cli_create_diff] vm.exec",
         vm.exec("echo", &["ready"]).await,
-    ) else {
-        return;
-    };
+    );
     assert!(
         output.success(),
         "[cli_create_diff] exec returned exit={:?} stdout={:?} stderr={:?}",
@@ -1137,17 +964,11 @@ async fn snapshot_cli_create_diff() {
         "[cli_create_diff] Taking base snapshot (hash={})...",
         &config_hash[..16]
     );
-    match vm
-        .snapshot(&base_dir, config_hash.clone(), snap_config())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("  base snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    }
+    expect_capable(
+        "[cli_create_diff] base snapshot",
+        vm.snapshot(&base_dir, config_hash.clone(), snap_config())
+            .await,
+    );
 
     let base_mem_size = std::fs::metadata(VmSnapshot::memory_path(&base_dir))
         .unwrap()
@@ -1159,28 +980,20 @@ async fn snapshot_cli_create_diff() {
 
     // --- Restore from base, enable dirty tracking, exec, take diff ---
     eprintln!("[cli_create_diff] Restoring from base snapshot...");
-    let restored_vm = match MicroVm::from_snapshot(&base_dir).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  base restore failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let restored_vm = expect_capable(
+        "[cli_create_diff] base from_snapshot",
+        MicroVm::from_snapshot(&base_dir).await,
+    );
 
     eprintln!("[cli_create_diff] Enabling dirty page tracking...");
     restored_vm
         .enable_dirty_tracking()
         .expect("enable dirty tracking");
 
-    let output = match restored_vm.exec("echo", &["snapshot-ready"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("  exec after dirty tracking failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            return;
-        }
-    };
+    let output = expect_capable(
+        "[cli_create_diff] dirty exec",
+        restored_vm.exec("echo", &["snapshot-ready"]).await,
+    );
     assert!(output.success());
     eprintln!("[cli_create_diff] Guest-agent ready after dirty tracking");
 
@@ -1189,23 +1002,17 @@ async fn snapshot_cli_create_diff() {
     std::fs::create_dir_all(&diff_dir).expect("create diff snapshot dir");
 
     eprintln!("[cli_create_diff] Taking diff snapshot...");
-    let diff_path = match restored_vm
-        .snapshot_diff(
-            &diff_dir,
-            config_hash.clone(),
-            snap_config(),
-            config_hash.clone(),
-        )
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  diff snapshot failed: {e}");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            let _ = std::fs::remove_dir_all(&diff_dir);
-            return;
-        }
-    };
+    let diff_path = expect_capable(
+        "[cli_create_diff] snapshot_diff",
+        restored_vm
+            .snapshot_diff(
+                &diff_dir,
+                config_hash.clone(),
+                snap_config(),
+                config_hash.clone(),
+            )
+            .await,
+    );
 
     // --- Verify list_snapshots() includes both base and diff ---
     let snapshots = snapshot::list_snapshots().expect("list_snapshots");
@@ -1276,23 +1083,17 @@ async fn snapshot_cli_create_diff() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires KVM + kernel/initramfs artifacts; see module docs"]
 async fn auto_snapshot_round_trip() {
-    let Some((kernel, initramfs)) = preflight() else {
-        return;
-    };
+    let (kernel, initramfs) = preflight();
     let cfg = build_config(&kernel, initramfs.as_deref());
 
     // --- Cold boot ---
     eprintln!("[auto_snapshot] Booting VM...");
-    let Some(vm) = diag_or_skip("[auto_snapshot] MicroVm::new", MicroVm::new(cfg).await) else {
-        return;
-    };
+    let vm = expect_capable("[auto_snapshot] MicroVm::new", MicroVm::new(cfg).await);
 
-    let Some(output) = diag_or_skip(
+    let output = expect_capable(
         "[auto_snapshot] vm.exec (cold boot)",
         vm.exec("echo", &["ready"]).await,
-    ) else {
-        return;
-    };
+    );
     assert!(
         output.success(),
         "[auto_snapshot] cold boot exec returned exit={:?} stdout={:?} stderr={:?}",
@@ -1310,24 +1111,16 @@ async fn auto_snapshot_round_trip() {
 
     eprintln!("[auto_snapshot] Taking snapshot...");
     let start = Instant::now();
-    let snap_path = match vm
-        .snapshot(snap_dir.path(), config_hash, snap_config())
-        .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("  snapshot failed: {e}");
-            return;
-        }
-    };
+    let snap_path = expect_capable(
+        "[auto_snapshot] snapshot",
+        vm.snapshot(snap_dir.path(), config_hash, snap_config())
+            .await,
+    );
 
-    let mut restored_vm = match MicroVm::from_snapshot(&snap_path).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            eprintln!("  restore failed: {e}");
-            return;
-        }
-    };
+    let mut restored_vm = expect_capable(
+        "[auto_snapshot] from_snapshot",
+        MicroVm::from_snapshot(&snap_path).await,
+    );
     let elapsed = start.elapsed();
     eprintln!("[auto_snapshot] Snapshot + restore took {:.1?}", elapsed);
 

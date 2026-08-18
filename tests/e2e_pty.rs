@@ -3,52 +3,30 @@
 //! Requires KVM, `VOID_BOX_KERNEL`, and `VOID_BOX_INITRAMFS` (test image
 //! with BusyBox for `/bin/sh`).
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 #[cfg(target_os = "linux")]
 mod pty_tests {
-    use super::vm_preflight;
+    use super::test_artifacts;
     use void_box::sandbox::Sandbox;
     use void_box_protocol::PtyOpenRequest;
 
-    fn skip_reason() -> Option<String> {
-        if let Err(err) = vm_preflight::require_kvm_usable() {
-            return Some(err);
-        }
-        if let Err(err) = vm_preflight::require_vsock_usable() {
-            return Some(err);
-        }
-        if std::env::var("VOID_BOX_KERNEL").is_err() {
-            return Some("VOID_BOX_KERNEL not set".into());
-        }
-        if std::env::var("VOID_BOX_INITRAMFS").is_err() {
-            return Some("VOID_BOX_INITRAMFS not set".into());
-        }
-        None
-    }
-
-    fn test_sandbox() -> Result<std::sync::Arc<Sandbox>, Box<dyn std::error::Error>> {
-        let kernel = std::env::var("VOID_BOX_KERNEL")?;
-        let initramfs = std::env::var("VOID_BOX_INITRAMFS")?;
-        let sandbox = Sandbox::local()
+    fn test_sandbox() -> std::sync::Arc<Sandbox> {
+        let (kernel, initramfs) = test_artifacts::artifacts();
+        let build = Sandbox::local()
             .kernel(&kernel)
             .initramfs(&initramfs)
             .memory_mb(512)
             .network(false)
-            .build()?;
-        Ok(sandbox)
+            .build();
+        test_artifacts::expect_vm(build, "sandbox build (e2e_pty)")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_open_and_immediate_exit() {
-        if let Some(reason) = skip_reason() {
-            eprintln!("SKIP: {}", reason);
-            return;
-        }
-
-        let sandbox = test_sandbox().unwrap();
+        let sandbox = test_sandbox();
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -73,12 +51,7 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_command_not_allowed() {
-        if let Some(reason) = skip_reason() {
-            eprintln!("SKIP: {}", reason);
-            return;
-        }
-
-        let sandbox = test_sandbox().unwrap();
+        let sandbox = test_sandbox();
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -103,12 +76,7 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_nonzero_exit_code() {
-        if let Some(reason) = skip_reason() {
-            eprintln!("SKIP: {}", reason);
-            return;
-        }
-
-        let sandbox = test_sandbox().unwrap();
+        let sandbox = test_sandbox();
 
         let request = PtyOpenRequest {
             cols: 80,
@@ -139,12 +107,7 @@ mod pty_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn pty_exit_code_survives_session_close() {
-        if let Some(reason) = skip_reason() {
-            eprintln!("SKIP: {}", reason);
-            return;
-        }
-
-        let sandbox = test_sandbox().unwrap();
+        let sandbox = test_sandbox();
 
         let request = PtyOpenRequest {
             cols: 80,

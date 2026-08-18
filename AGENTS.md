@@ -797,29 +797,29 @@ Static quality:
 cargo fmt --all -- --check
 ```
 
-Clippy (Linux):
+Clippy (guest-agent builds as a no-op stub on non-Linux, so the same commands run on macOS):
 ```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Clippy (macOS — excludes guest-agent, which is Linux-only):
-```bash
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-```
-
-Core tests (Linux):
+Core tests:
 ```bash
 cargo test --workspace --all-features
 cargo test --doc --workspace --all-features
 ```
 
-Core tests (macOS — excludes guest-agent):
+Ignored/VM suites. The deterministic suites auto-provision the pinned kernel and test initramfs into `target/` on first run, so `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` need not be set — an explicit override still wins (ADR-0011). The heavy agent suites `e2e_agent_mcp` and `e2e_service_mode` are the exception: they need a staged production image via those env vars and skip when it is absent. On a machine that genuinely cannot virtualize the suites skip loudly, but the reason prints only with `--nocapture`; on a machine you believe is capable, set `VOID_BOX_REQUIRE_VM=1` so a skip becomes a failure and nothing hides. A real boot or RPC failure always fails.
+
+To run the VM suites with bounded parallelism instead of one at a time, use nextest — each VM-booting binary joins the `vm` test group in `.config/nextest.toml`, capped at two concurrent boots. This runs every VM suite locally on a capable machine:
+
 ```bash
-cargo test --workspace --exclude guest-agent --all-features
-cargo test --doc --workspace --exclude guest-agent --all-features
+VOID_BOX_REQUIRE_VM=1 cargo nextest run --run-ignored only --no-fail-fast \
+  -E 'binary(/^(conformance|oci_integration|snapshot_integration|persistent_channel|telemetry|kvm_integration|e2e_.+)$/)'
 ```
 
-Ignored/VM suites (requires kernel/initramfs and usable KVM/vsock access):
+The Linux CI lane runs a fixed subset of these under `VOID_BOX_REQUIRE_VM=1`; `.github/workflows/e2e.yml` and `.config/nextest.toml` are the source of truth for exactly what CI runs.
+
+The explicit-artifact form (env override; still one suite at a time):
 
 ```bash
 export VOID_BOX_KERNEL=/path/to/vmlinuz
@@ -907,22 +907,15 @@ all required gates are explicit.
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld    # x86_64 host
   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld   # aarch64 host
   ```
-- VM suites require usable KVM/vsock (not only device presence). Beware: when `VOID_BOX_INITRAMFS` points at a missing file, the VM suites skip and still report `ok` — skip reasons go to test-captured stdout, invisible without `--nocapture`. Sub-second suite wall-times mean nothing booted; check that the image builds actually produced their artifacts before trusting a green run.
+- VM suites need usable KVM/vsock (not only device presence). A `VOID_BOX_INITRAMFS` that is set but points at a missing file is a configuration error and panics; unset auto-provisions. A genuine incapability skips, and the reason prints only with `--nocapture`, so a sub-second green suite still means nothing booted — set `VOID_BOX_REQUIRE_VM=1` on a machine you believe is capable to turn that skip into a failure.
 
 ### Standard validation sequence
 
-Linux:
+Same on Linux and macOS — guest-agent builds as a no-op stub on non-Linux, so no per-crate exclusion is needed:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-```
-
-macOS (excludes guest-agent, which is Linux-only):
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --exclude guest-agent --all-targets --all-features -- -D warnings
-cargo test --workspace --exclude guest-agent --all-features
 ```
 
 ### macOS dev setup

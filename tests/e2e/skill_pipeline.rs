@@ -7,26 +7,16 @@
 //! 3. claudio discovers provisioned skills and reports them in output
 //! 4. Pipeline composition works end-to-end with real VMs
 //!
-//! ## Prerequisites
+//! Kernel and initramfs are auto-provisioned by [`test_artifacts`] under
+//! `--ignored`; `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides.
+//! All tests are `#[ignore]`, so a plain `cargo test` never provisions or boots.
 //!
-//! 1. Build the test initramfs (includes updated claudio with skill discovery):
-//!    ```bash
-//!    scripts/build_test_image.sh
-//!    ```
-//!
-//! 2. Run with:
-//!    ```bash
-//!    VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!    VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-//!    cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
-//!    ```
-//!
-//! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
+//! ```bash
+//! cargo test --test e2e_skill_pipeline -- --ignored --test-threads=1
+//! ```
 
-use std::path::PathBuf;
-
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::agent_box::VoidBox;
 use void_box::pipeline::Pipeline;
@@ -36,46 +26,9 @@ use void_box::skill::Skill;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn kvm_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() || !kernel.exists() {
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() || !initramfs.exists() {
-        return None;
-    }
-
-    Some((kernel, initramfs))
-}
-
-/// Build an VoidBox pointing at real KVM artifacts.
-/// Returns None if KVM or artifacts are unavailable (test will skip).
-fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<VoidBox> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let (kernel, initramfs) = match kvm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return None;
-        }
-    };
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)) {
-        eprintln!("skipping: {e}");
-        return None;
-    }
+/// Build a VoidBox on the auto-provisioned test artifacts.
+fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> VoidBox {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut builder = VoidBox::new(name)
         .kernel(&kernel)
@@ -87,13 +40,7 @@ fn build_kvm_box(name: &str, skills: Vec<Skill>, prompt: &str) -> Option<VoidBox
         builder = builder.skill(skill);
     }
 
-    match builder.build() {
-        Ok(ab) => Some(ab),
-        Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {}", e);
-            None
-        }
-    }
+    test_artifacts::expect_vm(builder.build(), "skill_pipeline build")
 }
 
 // ===========================================================================
@@ -111,21 +58,9 @@ async fn test_agent_box_with_local_skill() {
         Skill::agent("claude-code"),
     ];
 
-    let ab = match build_kvm_box("data_analyst", skills, "Analyze AAPL stock data") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let ab = build_kvm_box("data_analyst", skills, "Analyze AAPL stock data");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
 
     // Basic checks
     assert_eq!(result.box_name, "data_analyst");
@@ -169,21 +104,9 @@ async fn test_agent_box_with_multiple_skills() {
         Skill::agent("claude-code"),
     ];
 
-    let ab = match build_kvm_box("multi_skill_box", skills, "Analyze and compute indicators") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let ab = build_kvm_box("multi_skill_box", skills, "Analyze and compute indicators");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
 
     assert!(!result.agent_result.is_error);
 
@@ -224,21 +147,9 @@ async fn test_agent_box_with_mcp_skill() {
         Skill::agent("claude-code"),
     ];
 
-    let ab = match build_kvm_box("mcp_box", skills, "Fetch market data") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let ab = build_kvm_box("mcp_box", skills, "Fetch market data");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
 
     assert!(!result.agent_result.is_error);
 
@@ -285,21 +196,9 @@ async fn test_agent_box_mixed_skills() {
         Skill::agent("claude-code"),
     ];
 
-    let ab = match build_kvm_box("mixed_box", skills, "Analyze with MCP data") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let ab = build_kvm_box("mixed_box", skills, "Analyze with MCP data");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "skill_pipeline run");
 
     assert!(!result.agent_result.is_error);
 
@@ -337,29 +236,16 @@ async fn test_pipeline_two_stages_kvm() {
         Skill::agent("claude-code"),
     ];
 
-    let box1 = match build_kvm_box("data_stage", box1_skills, "Collect market data") {
-        Some(ab) => ab,
-        None => return,
-    };
-    let box2 = match build_kvm_box("quant_stage", box2_skills, "Compute indicators") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let box1 = build_kvm_box("data_stage", box1_skills, "Collect market data");
+    let box2 = build_kvm_box("quant_stage", box2_skills, "Compute indicators");
 
-    let result = match Pipeline::named("two_stage_test", box1)
-        .pipe(box2)
-        .run()
-        .await
-    {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("Pipeline::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(
+        Pipeline::named("two_stage_test", box1)
+            .pipe(box2)
+            .run()
+            .await,
+        "skill_pipeline pipeline run",
+    );
 
     // Verify pipeline structure
     assert_eq!(result.stages.len(), 2);
@@ -406,22 +292,10 @@ async fn test_agent_box_with_input_data_kvm() {
         Skill::agent("claude-code"),
     ];
 
-    let ab = match build_kvm_box("input_box", skills, "Process the input data") {
-        Some(ab) => ab,
-        None => return,
-    };
+    let ab = build_kvm_box("input_box", skills, "Process the input data");
 
     let input = br#"{"symbols": ["AAPL", "NVDA"], "period": "30d"}"#;
-    let result = match ab.run(Some(input), None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("control_channel: deadline reached (connect or handshake)") =>
-        {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("VoidBox::run failed: {e}"),
-    };
+    let result = test_artifacts::expect_vm(ab.run(Some(input), None).await, "skill_pipeline run");
 
     assert_eq!(result.box_name, "input_box");
     assert!(!result.agent_result.is_error);

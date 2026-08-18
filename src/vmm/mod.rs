@@ -285,13 +285,18 @@ impl MicroVm {
         )?;
         debug!("Loaded kernel at entry point: {:#x}", entry_point);
 
-        // CID for vsock (must be > 2; 0-2 reserved)
+        // CID for vsock (must be > 2; 0-2 reserved). The CID — and the derived
+        // userspace-vsock socket path — must be unique across VMs booting
+        // concurrently, and nextest boots each test's VM in its own process, so
+        // time alone collides when two read the clock in the same nanosecond.
+        // Xor the pid into the seed so distinct processes get distinct CIDs.
         let cid = config.cid.unwrap_or_else(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
+            let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u32;
+            let seed = nanos ^ std::process::id().rotate_left(16);
             3 + (seed % 0xFFFF_FFFC)
         });
 

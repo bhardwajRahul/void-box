@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box::sidecar;
@@ -32,51 +32,17 @@ use void_box_protocol::SessionSecret;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
+fn vm_artifacts() -> (PathBuf, PathBuf) {
+    test_artifacts::artifacts()
 }
 
-fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
-    Some((kernel, initramfs))
-}
-
-fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<BackendConfig> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available");
-        return None;
-    }
-    let (kernel, initramfs) = match vm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return None;
-        }
-    };
+fn build_network_config_with_deny_list(deny_list: Vec<String>) -> BackendConfig {
+    let (kernel, initramfs) = vm_artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 256,
         vcpus: 1,
         kernel,
@@ -101,48 +67,38 @@ fn build_network_config_with_deny_list(deny_list: Vec<String>) -> Option<Backend
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
-fn build_network_config() -> Option<BackendConfig> {
+fn build_network_config() -> BackendConfig {
     build_network_config_with_deny_list(vec!["169.254.0.0/16".into()])
 }
 
 async fn start_backend() -> Option<Box<dyn VmmBackend>> {
-    let config = build_network_config()?;
-    let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
-    }
+    start_backend_with_config(build_network_config()).await
 }
 
 async fn start_backend_with_deny_list(deny_list: Vec<String>) -> Option<Box<dyn VmmBackend>> {
-    let config = build_network_config_with_deny_list(deny_list)?;
+    start_backend_with_config(build_network_config_with_deny_list(deny_list)).await
+}
+
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
+async fn start_backend_with_config(config: BackendConfig) -> Option<Box<dyn VmmBackend>> {
     let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
+    match test_artifacts::vm_start(backend.start(config).await, "backend start (sidecar)") {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
     }
 }
 
-async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::ExecOutput> {
-    match backend
-        .exec("sh", &["-c", script], &[], &[], None, Some(30))
-        .await
-    {
-        Ok(out) => Some(out),
-        Err(e) => {
-            eprintln!("guest exec error: {e}");
-            None
-        }
-    }
+async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> void_box::ExecOutput {
+    test_artifacts::expect_vm(
+        backend
+            .exec("sh", &["-c", script], &[], &[], None, Some(30))
+            .await,
+        "guest exec (sidecar)",
+    )
 }
 
 // ===========================================================================
@@ -152,9 +108,8 @@ async fn guest_sh(backend: &dyn VmmBackend, script: &str) -> Option<void_box::Ex
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_sidecar_health() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend().await else {
+        return;
     };
 
     // Start sidecar on host (random port)
@@ -175,10 +130,6 @@ async fn guest_reads_sidecar_health() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(out.success(), "wget failed: {}", out.stderr_str());
     let body = out.stdout_str();
@@ -199,9 +150,8 @@ async fn guest_reads_sidecar_health() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_inbox_and_posts_intent() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend().await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -238,10 +188,6 @@ async fn guest_reads_inbox_and_posts_intent() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(out.success(), "wget inbox failed: {}", out.stderr_str());
     let inbox: serde_json::Value =
@@ -258,10 +204,6 @@ async fn guest_reads_inbox_and_posts_intent() {
         void_box::backend::guest_host_url(port),
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(
         out.success(),
@@ -291,9 +233,8 @@ async fn guest_reads_inbox_and_posts_intent() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reads_context() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend().await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -313,10 +254,6 @@ async fn guest_reads_context() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(out.success(), "wget context failed: {}", out.stderr_str());
     let ctx: serde_json::Value =
@@ -337,9 +274,8 @@ async fn guest_reads_context() {
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_cannot_reach_denied_host_gateway() {
     let gateway_cidr = format!("{}/32", void_box::backend::guest_host_gateway());
-    let backend = match start_backend_with_deny_list(vec![gateway_cidr.clone()]).await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend_with_deny_list(vec![gateway_cidr.clone()]).await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -358,10 +294,6 @@ async fn guest_cannot_reach_denied_host_gateway() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert_eq!(
         out.exit_code,
@@ -376,10 +308,7 @@ async fn guest_cannot_reach_denied_host_gateway() {
         gateway_cidr
     );
 
-    let stderr_out = guest_sh(&*backend, "cat /tmp/deny.err").await;
-    let stderr_text = stderr_out
-        .map(|output| output.stdout_str())
-        .unwrap_or_default();
+    let stderr_text = guest_sh(&*backend, "cat /tmp/deny.err").await.stdout_str();
     eprintln!(
         "deny-list blocked guest->host request as expected: exit={} stderr={}",
         wget_exit,
@@ -396,9 +325,8 @@ async fn guest_cannot_reach_denied_host_gateway() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
-    let backend = match start_backend_with_deny_list(vec!["203.0.113.0/24".into()]).await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend_with_deny_list(vec!["203.0.113.0/24".into()]).await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -417,10 +345,6 @@ async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
         void_box::backend::guest_host_url(port)
     );
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(
         out.success(),
@@ -442,9 +366,8 @@ async fn guest_reaches_host_gateway_when_deny_list_targets_unrelated_cidr() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + network"]
 async fn guest_full_agent_flow() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend().await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -507,10 +430,6 @@ async fn guest_full_agent_flow() {
     );
 
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        handle.stop().await;
-        return;
-    };
 
     assert!(out.success(), "agent flow failed: {}", out.stderr_str());
     let stdout = out.stdout_str();
@@ -541,25 +460,7 @@ async fn claudio_discovers_injected_messaging_skill() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
-    let (kernel, initramfs) = match vm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        eprintln!("skipping: kernel/initramfs not found");
-        return;
-    }
+    let (kernel, initramfs) = vm_artifacts();
 
     // Start sidecar (skill content is now static, but we need the handle for cleanup)
     let handle = sidecar::start_sidecar(
@@ -588,25 +489,13 @@ async fn claudio_discovers_injected_messaging_skill() {
     {
         Ok(ab) => ab,
         Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {e}");
             handle.stop().await;
-            return;
+            panic!("VoidBox build failed on a capable machine: {e}");
         }
     };
 
     // Run claudio — it scans skills dir and reports discoveries
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (sidecar)");
 
     eprintln!("claudio result_text: {}", result.agent_result.result_text);
 
@@ -632,9 +521,8 @@ async fn claudio_discovers_injected_messaging_skill() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs with void-message"]
 async fn guest_uses_void_message_cli() {
-    let backend = match start_backend().await {
-        Some(b) => b,
-        None => return,
+    let Some(backend) = start_backend().await else {
+        return;
     };
 
     let handle = sidecar::start_sidecar(
@@ -669,29 +557,24 @@ async fn guest_uses_void_message_cli() {
     // Test: void-message health
     let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message health");
     let out = guest_sh(&*backend, &script).await;
-    let Some(out) = out else {
-        eprintln!("skipping: void-message not in initramfs (rebuild test image)");
-        handle.stop().await;
-        return;
-    };
-    if !out.success() {
-        eprintln!("skipping: void-message not available: {}", out.stderr_str());
-        handle.stop().await;
-        return;
-    }
+    assert!(
+        out.success(),
+        "void-message health failed in the auto-provisioned test image: {}",
+        out.stderr_str()
+    );
     let health: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
     assert_eq!(health["status"], "ok");
 
     // Test: void-message context
     let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message context");
-    let out = guest_sh(&*backend, &script).await.unwrap();
+    let out = guest_sh(&*backend, &script).await;
     assert!(out.success(), "context failed: {}", out.stderr_str());
     let ctx: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
     assert_eq!(ctx["candidate_id"], "c-1");
 
     // Test: void-message inbox
     let script = format!("VOID_SIDECAR_URL={sidecar_url} void-message inbox");
-    let out = guest_sh(&*backend, &script).await.unwrap();
+    let out = guest_sh(&*backend, &script).await;
     assert!(out.success(), "inbox failed: {}", out.stderr_str());
     let inbox: serde_json::Value = serde_json::from_str(&out.stdout_str()).unwrap();
     assert_eq!(inbox["entries"].as_array().unwrap().len(), 1);
@@ -700,7 +583,7 @@ async fn guest_uses_void_message_cli() {
     let script = format!(
         "VOID_SIDECAR_URL={sidecar_url} void-message send --kind signal --audience broadcast --summary 'cli e2e works'"
     );
-    let out = guest_sh(&*backend, &script).await.unwrap();
+    let out = guest_sh(&*backend, &script).await;
     assert!(out.success(), "send failed: {}", out.stderr_str());
 
     // Verify intent received by sidecar
@@ -724,25 +607,7 @@ async fn claudio_discovers_void_mcp_tools() {
     use void_box::agent_box::VoidBox;
     use void_box::skill::Skill;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
-        return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
-    let (kernel, initramfs) = match vm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
-    };
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        eprintln!("skipping: kernel/initramfs not found");
-        return;
-    }
+    let (kernel, initramfs) = vm_artifacts();
 
     // Start sidecar
     let handle = sidecar::start_sidecar(
@@ -775,24 +640,12 @@ async fn claudio_discovers_void_mcp_tools() {
     {
         Ok(ab) => ab,
         Err(e) => {
-            eprintln!("skipping: failed to build VoidBox: {e}");
             handle.stop().await;
-            return;
+            panic!("VoidBox build failed on a capable machine: {e}");
         }
     };
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (sidecar)");
 
     eprintln!("claudio result: {}", result.agent_result.result_text);
 

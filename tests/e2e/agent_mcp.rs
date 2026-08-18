@@ -20,31 +20,12 @@
 //!   ANTHROPIC_API_KEY=sk-... \
 //!   cargo test --test e2e_agent_mcp -- --ignored --test-threads=1 --nocapture
 
-use std::path::PathBuf;
-
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::agent_box::VoidBox;
 use void_box::sidecar;
 use void_box::skill::Skill;
-
-fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
-    Some((kernel, initramfs))
-}
 
 // ===========================================================================
 // Test: Real Claude Code discovers void-mcp tools and emits intents
@@ -60,20 +41,8 @@ fn vm_artifacts() -> Option<(PathBuf, PathBuf)> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires VM backend + kernel/initramfs + ANTHROPIC_API_KEY"]
 async fn real_claude_uses_void_mcp_tools() {
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
+    let Some((kernel, initramfs)) = test_artifacts::env_artifacts_or_skip() else {
         return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
-    let (kernel, initramfs) = match vm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
     };
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
         eprintln!("skipping: set ANTHROPIC_API_KEY");
@@ -146,18 +115,7 @@ async fn real_claude_uses_void_mcp_tools() {
 
     eprintln!("running real Claude Code with void-mcp...");
 
-    let result = match ab.run(None, None).await {
-        Ok(r) => r,
-        Err(void_box::Error::Guest(msg)) if msg.contains("control_channel: deadline reached") => {
-            eprintln!("skipping: guest control channel unavailable: {msg}");
-            handle.stop().await;
-            return;
-        }
-        Err(e) => {
-            handle.stop().await;
-            panic!("VoidBox::run failed: {e}");
-        }
-    };
+    let result = test_artifacts::expect_vm(ab.run(None, None).await, "guest run (agent_mcp)");
 
     eprintln!("=== Claude Result ===");
     eprintln!("model: {}", result.agent_result.model);
@@ -231,20 +189,8 @@ async fn diagnostic_void_mcp_starts_in_guest() {
     use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink};
     use void_box_protocol::SessionSecret;
 
-    if vm_preflight::require_kvm_usable().is_err() {
-        eprintln!("skipping: VM backend not available");
+    let Some((kernel, initramfs)) = test_artifacts::env_artifacts_or_skip() else {
         return;
-    }
-    if vm_preflight::require_vsock_usable().is_err() {
-        eprintln!("skipping: vsock not available");
-        return;
-    }
-    let (kernel, initramfs) = match vm_artifacts() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return;
-        }
     };
 
     // Start sidecar
@@ -292,10 +238,12 @@ async fn diagnostic_void_mcp_starts_in_guest() {
     };
 
     let mut backend = void_box::backend::create_backend();
-    if let Err(e) = backend.start(config).await {
-        eprintln!("skipping: backend start failed: {e}");
-        handle.stop().await;
-        return;
+    match test_artifacts::vm_start(
+        backend.start(config).await,
+        "backend start (agent_mcp diagnostic)",
+    ) {
+        test_artifacts::VmStart::Ready => {}
+        test_artifacts::VmStart::SkipIncapable => return,
     }
 
     // Test 1: void-mcp binary exists
@@ -320,9 +268,8 @@ async fn diagnostic_void_mcp_starts_in_guest() {
             panic!("void-mcp not in guest image — rebuild with scripts/build_test_image.sh");
         }
         Err(e) => {
-            eprintln!("exec failed: {e}");
             handle.stop().await;
-            return;
+            panic!("guest exec failed on a booted VM: {e}");
         }
     }
 
@@ -351,7 +298,8 @@ async fn diagnostic_void_mcp_starts_in_guest() {
             );
         }
         Err(e) => {
-            eprintln!("void-mcp exec failed: {e}");
+            handle.stop().await;
+            panic!("void-mcp handshake exec failed on a booted VM: {e}");
         }
     }
 

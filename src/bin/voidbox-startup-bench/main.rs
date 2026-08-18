@@ -66,6 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
+    // Threshold gates: when set, the process exits non-zero if the measured
+    // cold/warm `total` p50 exceeds the given bound in milliseconds. Without
+    // these flags the bench only prints and always exits 0. A flag present but
+    // missing/malformed its value is a hard error, so a typo cannot silently
+    // disable the gate.
+    let assert_cold_p50_ms = parse_ms_flag(&args, "--assert-cold-p50-ms")?;
+    let assert_warm_p50_ms = parse_ms_flag(&args, "--assert-warm-p50-ms")?;
+    if assert_cold_p50_ms.is_some() && warm_only {
+        return Err("--assert-cold-p50-ms cannot be combined with --warm-only".into());
+    }
+    if assert_warm_p50_ms.is_some() && cold_only {
+        return Err("--assert-warm-p50-ms cannot be combined with --cold-only".into());
+    }
+
     eprintln!(
         "voidbox-startup-bench: pid={} iters={} memory_mb={}",
         std::process::id(),
@@ -81,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "warmup: build={:>7.1?} boot={:>7.1?} stop={:>7.1?} total={:>7.1?}",
         warmup.build, warmup.boot, warmup.stop, warmup.total
     );
+
+    let mut failures: Vec<String> = Vec::new();
 
     if !warm_only {
         eprintln!("\n-- cold boot --");
@@ -105,7 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report("cold.build", cold.iter().map(|s| s.build));
         report("cold.boot", cold.iter().map(|s| s.boot));
         report("cold.stop", cold.iter().map(|s| s.stop));
-        report("cold.total", cold.iter().map(|s| s.total));
+        let cold_p50 = report("cold.total", cold.iter().map(|s| s.total));
+        assert_phase("cold.total", assert_cold_p50_ms, cold_p50, &mut failures);
     }
 
     if !cold_only {
@@ -127,10 +144,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report("warm.build", warm.iter().map(|s| s.build));
         report("warm.boot", warm.iter().map(|s| s.boot));
         report("warm.stop", warm.iter().map(|s| s.stop));
-        report("warm.total", warm.iter().map(|s| s.total));
+        let warm_p50 = report("warm.total", warm.iter().map(|s| s.total));
+        assert_phase("warm.total", assert_warm_p50_ms, warm_p50, &mut failures);
+    }
+
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("ASSERT FAILED: {f}");
+        }
+        return Err(format!(
+            "{} startup-bench threshold assertion(s) failed",
+            failures.len()
+        )
+        .into());
     }
 
     Ok(())
+}
+
+/// Parse a `--flag <milliseconds>` gate. Absent flag → `None`; present flag with
+/// a missing or non-numeric value → hard error (a typo must not disable the gate).
+fn parse_ms_flag(args: &[String], flag: &str) -> Result<Option<u64>, String> {
+    let Some(i) = args.iter().position(|a| a == flag) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(i + 1)
+        .ok_or_else(|| format!("{flag} requires a value in milliseconds"))?;
+    let ms = value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} value '{value}' is not a valid u64 (milliseconds)"))?;
+    Ok(Some(ms))
+}
+
+/// Record a threshold breach for `label`. When a bound is set but the phase
+/// produced no p50 (no iterations), that is itself a failure — the gate must not
+/// silently pass because nothing ran.
+fn assert_phase(
+    label: &str,
+    limit_ms: Option<u64>,
+    p50: Option<Duration>,
+    failures: &mut Vec<String>,
+) {
+    let Some(limit_ms) = limit_ms else {
+        return;
+    };
+    match p50 {
+        Some(p50) => {
+            let p50_ms = p50.as_secs_f64() * 1000.0;
+            if p50_ms > limit_ms as f64 {
+                failures.push(format!(
+                    "{label} p50 {p50_ms:.1}ms exceeds threshold {limit_ms}ms"
+                ));
+            }
+        }
+        None => failures.push(format!("{label}: no samples to assert (increase --iters)")),
+    }
 }
 
 /// Boot once, take a snapshot at `dir`, return the same path.
@@ -271,21 +340,25 @@ async fn bench_once_with_console(
     })
 }
 
-fn report(label: &str, samples: impl Iterator<Item = Duration>) {
+/// Print the min/p50/p95/p99/max distribution for `label`, and return the p50
+/// so a caller can gate on it. Returns `None` for an empty sample set.
+fn report(label: &str, samples: impl Iterator<Item = Duration>) -> Option<Duration> {
     let mut v: Vec<Duration> = samples.collect();
     v.sort();
     if v.is_empty() {
-        return;
+        return None;
     }
     let p = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+    let p50 = p(0.50);
     eprintln!(
         "{:<6}  min={:>7.1?}  p50={:>7.1?}  p95={:>7.1?}  p99={:>7.1?}  max={:>7.1?}  n={}",
         label,
         v[0],
-        p(0.50),
+        p50,
         p(0.95),
         p(0.99),
         v[v.len() - 1],
         v.len(),
     );
+    Some(p50)
 }

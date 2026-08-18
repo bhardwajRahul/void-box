@@ -18,8 +18,8 @@
 
 use std::path::PathBuf;
 
-#[path = "common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::backend::{BackendConfig, BackendSecurityConfig, GuestConsoleSink, VmmBackend};
 use void_box_protocol::SessionSecret;
@@ -27,39 +27,11 @@ use void_box_protocol::SessionSecret;
 /// Number of concurrent `exec` RPCs fired at the multiplex channel.
 const CONCURRENT_EXEC_COUNT: usize = 16;
 
-fn backend_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        vm_preflight::require_kvm_usable().is_ok() && vm_preflight::require_vsock_usable().is_ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
-}
-
-fn backend_config() -> Option<BackendConfig> {
-    let kernel = std::env::var("VOID_BOX_KERNEL").ok()?;
-    let kernel = PathBuf::from(kernel);
-    if kernel.as_os_str().is_empty() {
-        return None;
-    }
-
-    let initramfs = std::env::var("VOID_BOX_INITRAMFS").ok()?;
-    let initramfs = PathBuf::from(initramfs);
-    if initramfs.as_os_str().is_empty() {
-        return None;
-    }
-    if vm_preflight::require_kernel_artifacts(&kernel, Some(&initramfs)).is_err() {
-        return None;
-    }
+fn backend_config() -> BackendConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
     let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
+    getrandom::fill(&mut secret).expect("getrandom");
 
     // Under VOID_BOX_DIAGNOSTIC=1, route the guest serial console to a file so
     // the Azure-CI handshake-deadline failure leaves a host-readable trail
@@ -82,7 +54,7 @@ fn backend_config() -> Option<BackendConfig> {
         GuestConsoleSink::Disabled
     };
 
-    Some(BackendConfig {
+    BackendConfig {
         memory_mb: 2048,
         vcpus: 2,
         kernel,
@@ -107,27 +79,19 @@ fn backend_config() -> Option<BackendConfig> {
         },
         snapshot: None,
         enable_snapshots: false,
-    })
+    }
 }
 
+/// Start the backend, or `None` when the host genuinely cannot virtualize (the
+/// caller skips). A real boot failure on a capable host panics inside `vm_start`.
 async fn create_started_backend() -> Option<Box<dyn VmmBackend>> {
-    if !backend_available() {
-        eprintln!("skipping: VM backend not available on this platform");
-        return None;
-    }
-
-    let Some(config) = backend_config() else {
-        eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-        return None;
-    };
-
     let mut backend = void_box::backend::create_backend();
-    match backend.start(config).await {
-        Ok(()) => Some(backend),
-        Err(e) => {
-            eprintln!("skipping: backend start failed: {e}");
-            None
-        }
+    match test_artifacts::vm_start(
+        backend.start(backend_config()).await,
+        "backend start (persistent_channel)",
+    ) {
+        test_artifacts::VmStart::Ready => Some(backend),
+        test_artifacts::VmStart::SkipIncapable => None,
     }
 }
 

@@ -5,27 +5,18 @@
 //! as `/usr/local/bin/claude-code` in the test initramfs, providing deterministic
 //! telemetry output without requiring an Anthropic API key.
 //!
-//! ## Prerequisites
+//! Kernel and initramfs are auto-provisioned by [`test_artifacts`] under
+//! `--ignored`; `VOID_BOX_KERNEL` / `VOID_BOX_INITRAMFS` are optional overrides.
+//! All tests are `#[ignore]`, so a plain `cargo test` never provisions or boots.
 //!
-//! 1. Build the test initramfs:
-//!    ```bash
-//!    scripts/build_test_image.sh
-//!    ```
-//!
-//! 2. Run with:
-//!    ```bash
-//!    VOID_BOX_KERNEL=/boot/vmlinuz-$(uname -r) \
-//!    VOID_BOX_INITRAMFS=/tmp/void-box-test-rootfs.cpio.gz \
-//!    cargo test --test e2e_telemetry -- --ignored
-//!    ```
-//!
-//! All tests are `#[ignore]` so they don't run in a normal `cargo test`.
+//! ```bash
+//! cargo test --test e2e_telemetry -- --ignored --test-threads=1
+//! ```
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-#[path = "../common/vm_preflight.rs"]
-mod vm_preflight;
+#[path = "../common/test_artifacts.rs"]
+mod test_artifacts;
 
 use void_box::observe::claude::{parse_stream_json, AgentExecOpts};
 use void_box::observe::tracer::{SpanContext, Tracer, TracerConfig};
@@ -37,127 +28,38 @@ use void_box::vmm::MicroVm;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-fn kvm_artifacts_from_env() -> Option<(PathBuf, Option<PathBuf>)> {
-    let kernel = std::env::var_os("VOID_BOX_KERNEL")?;
-    let kernel = PathBuf::from(kernel);
-    let initramfs = std::env::var_os("VOID_BOX_INITRAMFS").map(PathBuf::from);
-    Some((kernel, initramfs))
-}
+/// Build a `VoidBoxConfig` on the auto-provisioned test artifacts.
+fn setup_test_vm() -> VoidBoxConfig {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-/// Try to build a VoidBoxConfig. Returns `None` if KVM or artifacts are unavailable.
-fn setup_test_vm() -> Option<(VoidBoxConfig, PathBuf, Option<PathBuf>)> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let (kernel, initramfs) = match kvm_artifacts_from_env() {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS \
-                 (use scripts/build_test_image.sh)"
-            );
-            return None;
-        }
-    };
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let mut cfg = VoidBoxConfig::new()
+    VoidBoxConfig::new()
         .memory_mb(256)
         .vcpus(1)
         .kernel(&kernel)
-        .enable_vsock(true);
-
-    if let Some(ref p) = initramfs {
-        cfg = cfg.initramfs(p);
-    }
-
-    Some((cfg, kernel, initramfs))
+        .initramfs(&initramfs)
+        .enable_vsock(true)
 }
 
 /// Build a Sandbox::local() backed by a real KVM VM.
-fn build_test_sandbox() -> Option<Arc<Sandbox>> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let (kernel, initramfs) = match kvm_artifacts_from_env() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: set VOID_BOX_KERNEL and VOID_BOX_INITRAMFS");
-            return None;
-        }
-    };
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
-
-    if let Some(ref p) = initramfs {
-        builder = builder.initramfs(p);
-    }
-
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping: failed to build sandbox: {e}");
-            None
-        }
-    }
+fn build_test_sandbox() -> Arc<Sandbox> {
+    build_test_sandbox_with_env(vec![])
 }
 
 /// Build a Sandbox::local() with custom env vars for claudio configuration.
-fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Option<Arc<Sandbox>> {
-    if let Err(e) = vm_preflight::require_kvm_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-    if let Err(e) = vm_preflight::require_vsock_usable() {
-        eprintln!("skipping: {e}");
-        return None;
-    }
+fn build_test_sandbox_with_env(env: Vec<(&str, &str)>) -> Arc<Sandbox> {
+    let (kernel, initramfs) = test_artifacts::artifacts();
 
-    let (kernel, initramfs) = kvm_artifacts_from_env()?;
-
-    if let Err(e) = vm_preflight::require_kernel_artifacts(&kernel, initramfs.as_deref()) {
-        eprintln!("skipping: {e}");
-        return None;
-    }
-
-    let mut builder = Sandbox::local().memory_mb(256).vcpus(1).kernel(&kernel);
-
-    if let Some(ref p) = initramfs {
-        builder = builder.initramfs(p);
-    }
+    let mut builder = Sandbox::local()
+        .memory_mb(256)
+        .vcpus(1)
+        .kernel(&kernel)
+        .initramfs(&initramfs);
 
     for (k, v) in env {
         builder = builder.env(k, v);
     }
 
-    match builder.build() {
-        Ok(sb) => Some(sb),
-        Err(e) => {
-            eprintln!("skipping: failed to build sandbox: {e}");
-            None
-        }
-    }
+    test_artifacts::expect_vm(builder.build(), "telemetry sandbox build")
 }
 
 /// Helper: run claudio in a sandbox with given scenario env vars, return parsed result.
@@ -194,10 +96,7 @@ async fn run_claudio(
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_default_scenario() {
-    let sandbox = match build_test_sandbox() {
-        Some(sb) => sb,
-        None => return,
-    };
+    let sandbox = build_test_sandbox();
 
     // --- A) Parse stream-json ---
     let result = run_claudio(&sandbox, "hello world test").await;
@@ -278,26 +177,20 @@ async fn test_default_scenario() {
         ..Default::default()
     };
     let provider = void_box::llm::LlmProvider::Claude;
-    match sandbox.exec_agent(&provider, "exec_agent test", opts).await {
-        Ok(result2) => {
-            assert!(!result2.is_error, "exec_agent should not error");
-            assert!(
-                !result2.session_id.is_empty(),
-                "exec_agent should have session_id"
-            );
-            assert!(
-                !result2.tool_calls.is_empty(),
-                "exec_agent should have tool calls"
-            );
-            eprintln!("  [C] exec_agent() works correctly");
-        }
-        Err(void_box::Error::Guest(msg))
-            if msg.contains("guest does not have `claude-code` in PATH") =>
-        {
-            eprintln!("  [C] skipped exec_agent() check: {}", msg);
-        }
-        Err(e) => panic!("exec_agent failed: {e}"),
-    }
+    let result2 = test_artifacts::expect_vm(
+        sandbox.exec_agent(&provider, "exec_agent test", opts).await,
+        "exec_agent",
+    );
+    assert!(!result2.is_error, "exec_agent should not error");
+    assert!(
+        !result2.session_id.is_empty(),
+        "exec_agent should have session_id"
+    );
+    assert!(
+        !result2.tool_calls.is_empty(),
+        "exec_agent should have tool calls"
+    );
+    eprintln!("  [C] exec_agent() works correctly");
 
     // Note: we don't call sandbox.stop() -- vCPU threads are blocked in KVM_RUN
     // and won't exit until the process ends. The Drop impl handles cleanup.
@@ -313,10 +206,7 @@ async fn test_default_scenario() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_traceparent_propagation() {
-    let (cfg, _kernel, _initramfs) = match setup_test_vm() {
-        Some(v) => v,
-        None => return,
-    };
+    let cfg = setup_test_vm();
 
     cfg.validate().expect("invalid config");
     let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
@@ -363,21 +253,20 @@ async fn test_traceparent_propagation() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_telemetry_aggregator() {
-    let (cfg, _kernel, _initramfs) = match setup_test_vm() {
-        Some(v) => v,
-        None => return,
-    };
+    let cfg = setup_test_vm();
 
     cfg.validate().expect("invalid config");
     let mut vm = MicroVm::new(cfg).await.expect("failed to create VM");
 
     // Warmup: ensure VM is ready
-    let _warmup = vm
-        .exec(
+    test_artifacts::expect_vm(
+        vm.exec(
             "claude-code",
             &["-p", "warmup", "--output-format", "stream-json"],
         )
-        .await;
+        .await,
+        "warmup exec",
+    );
 
     let observer = void_box::observe::Observer::test();
     let opts = void_box::guest::protocol::TelemetrySubscribeRequest::default();
@@ -436,10 +325,7 @@ async fn test_telemetry_aggregator() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_error_scenario() {
-    let sandbox = match build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "error")]) {
-        Some(sb) => sb,
-        None => return,
-    };
+    let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "error")]);
 
     let output = sandbox
         .exec(
@@ -485,10 +371,7 @@ async fn test_error_scenario() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_heavy_scenario() {
-    let sandbox = match build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "heavy")]) {
-        Some(sb) => sb,
-        None => return,
-    };
+    let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "heavy")]);
 
     let result = run_claudio(&sandbox, "build a complex application").await;
 
@@ -529,10 +412,7 @@ async fn test_heavy_scenario() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_multi_tool_scenario() {
-    let sandbox = match build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "multi_tool")]) {
-        Some(sb) => sb,
-        None => return,
-    };
+    let sandbox = build_test_sandbox_with_env(vec![("MOCK_CLAUDE_SCENARIO", "multi_tool")]);
 
     let result = run_claudio(&sandbox, "refactor the code").await;
 
@@ -561,7 +441,7 @@ async fn test_multi_tool_scenario() {
 #[tokio::test]
 #[ignore = "requires KVM + test initramfs from scripts/build_test_image.sh"]
 async fn test_configurable_env_overrides() {
-    let sandbox = match build_test_sandbox_with_env(vec![
+    let sandbox = build_test_sandbox_with_env(vec![
         ("MOCK_CLAUDE_INPUT_TOKENS", "1234"),
         ("MOCK_CLAUDE_OUTPUT_TOKENS", "567"),
         ("MOCK_CLAUDE_COST", "0.042"),
@@ -569,10 +449,7 @@ async fn test_configurable_env_overrides() {
             "TRACEPARENT",
             "00-abcd1234abcd1234abcd1234abcd1234-1234567890abcdef-01",
         ),
-    ]) {
-        Some(sb) => sb,
-        None => return,
-    };
+    ]);
 
     let output = sandbox
         .exec(

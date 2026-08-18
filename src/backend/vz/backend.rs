@@ -258,6 +258,21 @@ fn format_vz_ns_error(err: *mut objc2_foundation::NSError) -> String {
     out
 }
 
+/// Whether a Virtualization.framework error means the host cannot virtualize at
+/// all, rather than a real config or runtime error.
+///
+/// Apple reports "no hypervisor" as a config-validation failure with the same
+/// `VZError` code as a genuine bad config, so only the message distinguishes
+/// them. This is the one place that reads that message; the backend then raises
+/// the typed [`crate::Error::HypervisorUnavailable`] so callers classify on the
+/// type. A real config bug does not name unavailable hardware, so it fails.
+fn vz_error_is_hardware_unavailable(e: &objc2_foundation::NSError) -> bool {
+    // `to_string()` is the localizedDescription, where Apple puts this phrase —
+    // read it directly, not the richer `format_vz_ns_error`.
+    e.to_string()
+        .contains("Virtualization is not available on this hardware")
+}
+
 /// Reconcile a caller-supplied `BackendConfig` with the saved metadata so the
 /// reconstructed VZ configuration matches the save blob device-for-device.
 ///
@@ -631,10 +646,14 @@ impl VzBackend {
         // we always validate, since the whole operation depends on it.
         unsafe {
             vm_config.validateWithError().map_err(|e| {
-                crate::Error::Backend(format!(
-                    "VZ config validation: {}",
-                    enrich_vz_validation_error(&e.to_string())
-                ))
+                if vz_error_is_hardware_unavailable(&e) {
+                    crate::Error::HypervisorUnavailable(format!("Virtualization.framework: {e}"))
+                } else {
+                    crate::Error::Backend(format!(
+                        "VZ config validation: {}",
+                        enrich_vz_validation_error(&e.to_string())
+                    ))
+                }
             })?;
             if validate_save_restore {
                 vm_config
