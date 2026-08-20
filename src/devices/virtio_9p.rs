@@ -22,9 +22,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use tracing::{debug, trace, warn};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::devices::virtio_net::mmio;
+use crate::devices::virtqueue::ring_addr;
 
 // ---------------------------------------------------------------------------
 // Virtio constants
@@ -56,6 +57,22 @@ const MAX_SYMLINK_FOLLOWS: usize = 20;
 // ---------------------------------------------------------------------------
 // 9P2000.L message types
 // ---------------------------------------------------------------------------
+
+/// Largest 9P message the device will agree to in `Tversion`, and therefore the
+/// largest reply it will ever build. A guest may ask for more; the negotiated
+/// value is the minimum of its request and this.
+const MAX_MSIZE: u32 = 64 * 1024;
+
+/// Smallest `msize` the device will agree to. A 9P header plus the largest
+/// fixed reply must fit, and a guest that negotiates below this would starve the
+/// request-assembly budget in `process_queue` — including for the `Tversion`
+/// that would renegotiate.
+const MIN_MSIZE: u32 = 4 * 1024;
+
+/// Bytes a reply spends before its data: the 9P header (size, type, tag) plus
+/// the `count` field that `Rread` and `Rreaddir` carry. Data must fit in
+/// `msize` minus this.
+const REPLY_OVERHEAD: u32 = 7 + 4;
 
 const T_VERSION: u8 = 100;
 const R_VERSION: u8 = 101;
@@ -160,12 +177,43 @@ pub struct Virtio9pDevice {
     /// open(O_CREAT) / mkdir against any path that has been re-validated
     /// since the chown round-trip. See issue #52.
     mapped_uid_gid: Option<(u32, u32)>,
+    /// Largest message either side may send, as agreed in `Tversion`.
+    ///
+    /// `Tread` carries a guest-chosen `count` that sizes the reply buffer, and
+    /// a reply may not exceed `msize`. Holding the negotiated value is what lets
+    /// the read path bound that allocation; without it the guest's `count` — up
+    /// to 4 GiB — reaches the allocator directly. Starts at [`MAX_MSIZE`], the
+    /// ceiling negotiation can never exceed, so a request that arrives before
+    /// `Tversion` is bounded on the same terms.
+    msize: u32,
     // internal virtqueue tracking
     avail_idx: u16,
     used_idx: u16,
 }
 
 impl Virtio9pDevice {
+    /// A single directory-entry name, as `Tlcreate` / `Tmkdir` require, or
+    /// `None` when the guest sent something that is a path instead.
+    ///
+    /// These handlers build their target as `parent.join(name)`, and validating
+    /// only the parent does not constrain the result: `Path::join` with an
+    /// absolute name discards the base outright, and `..` is resolved by the
+    /// kernel at `create_dir`/`open` time. Either escapes the shared directory.
+    /// The sibling handlers that take a whole path go through
+    /// [`Self::normalize_under_root`]; these two take a name, so the tighter
+    /// check applies — a 9P name is one entry, with no separator in it.
+    fn entry_name(name: &str) -> Option<&std::ffi::OsStr> {
+        let mut components = std::path::Path::new(name).components();
+        let first = components.next()?;
+        if components.next().is_some() {
+            return None;
+        }
+        match first {
+            std::path::Component::Normal(component) => Some(component),
+            _ => None,
+        }
+    }
+
     fn normalize_under_root(root: &PathBuf, path: &std::path::Path) -> Option<PathBuf> {
         let mut out = root.clone();
         for comp in path.components() {
@@ -216,6 +264,7 @@ impl Virtio9pDevice {
             read_only,
             fids: HashMap::new(),
             mapped_uid_gid: None,
+            msize: MAX_MSIZE,
             avail_idx: 0,
             used_idx: 0,
         }
@@ -347,7 +396,11 @@ impl Virtio9pDevice {
                 self.queue_sel = value;
             }
             mmio::QUEUE_NUM => {
-                self.queue.num = value as u16;
+                // The guest may not exceed the size the device advertises in
+                // `QueueNumMax`; the virtio spec forbids it, and the descriptor
+                // walk's bound is derived from this value, so an unclamped write
+                // would let the guest set its own bound.
+                self.queue.num = (value as u16).min(self.queue.num_max);
             }
             mmio::QUEUE_READY => {
                 self.queue.ready = value != 0;
@@ -436,6 +489,10 @@ impl Virtio9pDevice {
             ..Default::default()
         };
         self.fids.clear();
+        // Negotiated per connection, so a reset must return it to the ceiling
+        // with everything else. Leaving the previous driver's value would apply
+        // a stale, smaller request cap to the next driver's first requests.
+        self.msize = MAX_MSIZE;
         self.avail_idx = 0;
         self.used_idx = 0;
     }
@@ -449,26 +506,33 @@ impl Virtio9pDevice {
             return Ok(());
         }
 
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
         let queue_size = q.num as usize;
+        // Every address below is a base the guest wrote to an MMIO register plus
+        // an offset. `vm_memory`'s `unchecked_add` is a plain `+`, so a base near
+        // `u64::MAX` panics under `overflow-checks` and wraps onto low mapped
+        // memory otherwise; `ring_addr` rejects the address instead.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
+        let Some(avail_idx_addr) = ring_addr(avail_base, 2) else {
+            warn!("virtio-9p: available ring at {avail_base:#x} overflows the address space");
+            return Ok(());
+        };
 
         // Read current available index from the driver ring
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read(&mut idx_buf, avail_idx_addr)
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
         while self.avail_idx != avail_idx {
             // Read head descriptor index from available ring
             let ring_offset = 4 + ((self.avail_idx as usize) % queue_size) * 2;
+            let Some(ring_entry_addr) = ring_addr(avail_base, ring_offset as u64) else {
+                warn!("virtio-9p: available ring entry overflows the address space");
+                return Ok(());
+            };
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            mem.read(&mut desc_id_buf, ring_entry_addr)
+                .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             // Walk the descriptor chain: collect request bytes and find the
@@ -476,12 +540,28 @@ impl Virtio9pDevice {
             let mut request_data = Vec::new();
             let mut response_descs: Vec<(u64, u32)> = Vec::new(); // (guest addr, len)
             let mut next = head_idx;
+            let mut walked = 0usize;
 
             loop {
                 if next >= queue_size {
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
+                // A chain cannot be longer than the table it indexes into. A
+                // descriptor whose NEXT points back into the chain — at itself,
+                // or around a cycle — would otherwise spin here forever while
+                // `response_descs` grows without bound.
+                if walked >= queue_size {
+                    warn!("virtio-9p: descriptor chain longer than the {queue_size}-entry table (cycle?)");
+                    break;
+                }
+                walked += 1;
+
+                let Some(desc_off) = ring_addr(desc_base, (next * 16) as u64) else {
+                    warn!(
+                        "virtio-9p: descriptor table at {desc_base:#x} overflows the address space"
+                    );
+                    return Ok(());
+                };
                 let mut desc = [0u8; 16];
                 mem.read(&mut desc, desc_off)
                     .map_err(|e| crate::Error::Memory(e.to_string()))?;
@@ -495,9 +575,16 @@ impl Virtio9pDevice {
                     // Device-writable: response buffer
                     response_descs.push((addr, dlen));
                 } else {
-                    // Device-readable: request data
-                    if dlen > 0 && addr != 0 {
-                        let mut buf = vec![0u8; dlen as usize];
+                    // Device-readable: request data. `dlen` is a guest-written
+                    // descriptor length, so it sizes this buffer directly — one
+                    // descriptor could ask for 4 GiB, and a chain could repeat
+                    // it. The request is a 9P message, which by definition fits
+                    // in the negotiated `msize`, so anything past that budget is
+                    // bytes the device would refuse to parse anyway.
+                    let budget = (self.msize as usize).saturating_sub(request_data.len());
+                    let readable = (dlen as usize).min(budget);
+                    if readable > 0 && addr != 0 {
+                        let mut buf = vec![0u8; readable];
                         mem.read(&mut buf, GuestAddress(addr))
                             .map_err(|e| crate::Error::Memory(e.to_string()))?;
                         request_data.extend_from_slice(&buf);
@@ -529,20 +616,28 @@ impl Virtio9pDevice {
 
             // Update used ring
             let used_ring_off = 4 + ((self.used_idx as usize) % queue_size) * 8;
+            let Some(used_elem_addr) = ring_addr(used_base, used_ring_off as u64) else {
+                warn!("virtio-9p: used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_elem = [
                 (head_idx as u32).to_le_bytes(),
                 (written as u32).to_le_bytes(),
             ]
             .concat();
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.used_idx = self.used_idx.wrapping_add(1);
             self.avail_idx = self.avail_idx.wrapping_add(1);
 
             // Update used.idx so guest sees progress
+            let Some(used_idx_addr) = ring_addr(used_base, 2) else {
+                warn!("virtio-9p: used ring at {used_base:#x} overflows the address space");
+                return Ok(());
+            };
             let used_idx_bytes = self.used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write(&used_idx_bytes, used_idx_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
@@ -555,14 +650,27 @@ impl Virtio9pDevice {
 
     /// Dispatch an incoming 9P request and return the full response message
     /// (including the 4-byte size header).
-    fn handle_9p_request(&mut self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn handle_9p_request(&mut self, data: &[u8]) -> Vec<u8> {
         // Minimum 9P header: size(4) + type(1) + tag(2) = 7 bytes
         if data.len() < 7 {
             warn!("virtio-9p: request too short ({} bytes)", data.len());
             return Self::build_error(0, libc::EIO as u32);
         }
 
-        let _msg_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let msg_size = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        // The header declares the whole message. A mismatch means either a guest
+        // that lied or a request `process_queue` truncated at the `msize` budget;
+        // either way the handlers below would parse a payload that is not the one
+        // the header describes. Rejecting here makes that explicit instead of
+        // leaving each handler's own length check to surface it as some other
+        // errno.
+        if msg_size as usize != data.len() {
+            warn!(
+                "virtio-9p: request declares {msg_size} bytes but carries {}",
+                data.len()
+            );
+            return Self::build_error(0, libc::EIO as u32);
+        }
         let msg_type = data[4];
         let tag = u16::from_le_bytes(data[5..7].try_into().unwrap());
         let payload = &data[7..];
@@ -650,8 +758,27 @@ impl Virtio9pDevice {
         }
 
         let client_msize = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-        // We use the minimum of client and a reasonable max
-        let msize = client_msize.min(64 * 1024);
+
+        // A request below the floor is refused rather than raised. `process_queue`
+        // derives its request-assembly budget from `msize`, and a budget near zero
+        // starves every later request — including the `Tversion` that would
+        // renegotiate — so the device will not serve one. Answering with a larger
+        // value instead would break the negotiation the other way: the reply is a
+        // commitment not to exceed what the client can receive, and a client that
+        // asked for 1024 has not agreed to read 4096. Refusing leaves the client
+        // free to retry with a size both sides can serve.
+        //
+        // The error is `EINVAL` on the size, not the `Rversion` "unknown" reply
+        // reserved for a version string the server cannot speak: `9P2000.L` is
+        // spoken here, and it is the size that cannot be served.
+        if client_msize < MIN_MSIZE {
+            warn!("virtio-9p: Tversion msize={client_msize} is below the {MIN_MSIZE} minimum");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        }
+
+        // Lowering is in contract, so the ceiling clamps rather than refuses.
+        let msize = client_msize.min(MAX_MSIZE);
+        self.msize = msize;
 
         // Clear all fids on version negotiation (as per spec)
         self.fids.clear();
@@ -749,8 +876,26 @@ impl Virtio9pDevice {
             Err(_) => return Self::build_error(tag, libc::EIO as u32),
         };
 
+        // `nwname` is a guest u16 and each walked component costs a 13-byte QID in
+        // the reply, so an unbounded walk builds an `Rwalk` several times the
+        // negotiated `msize` — the same size-field-versus-delivered-bytes desync
+        // the read and readdir caps prevent. A conforming client never walks
+        // more components than fit.
+        //
+        // Over budget answers `EINVAL` rather than 9P's short `Rwalk` with
+        // `nwqid < nwname`. A short reply means "the walk stopped here because
+        // this component does not exist", which would be a lie about the
+        // filesystem: the components may all exist and the request is simply one
+        // the negotiated size cannot answer. That is a malformed request, and an
+        // error says so without inventing a filesystem result.
+        let max_qids = (self.msize.saturating_sub(REPLY_OVERHEAD) as usize) / QID_SIZE;
+
         let mut walked_names: Vec<String> = Vec::new();
         for _ in 0..nwname {
+            if qids.len() >= max_qids {
+                warn!("virtio-9p: Twalk of {nwname} components exceeds the msize reply budget");
+                return Self::build_error(tag, libc::EINVAL as u32);
+            }
             if off + 2 > payload.len() {
                 return Self::build_error(tag, libc::EINVAL as u32);
             }
@@ -971,7 +1116,11 @@ impl Virtio9pDevice {
             None => return Self::build_error(tag, libc::EBADF as u32),
         };
 
-        let new_path = parent_path.join(&name);
+        let Some(entry) = Self::entry_name(&name) else {
+            warn!("virtio-9p: Tlcreate name {name:?} is not a single entry name");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        };
+        let new_path = parent_path.join(entry);
 
         // Security check
         if let Ok(root) = self.root_dir.canonicalize() {
@@ -1085,6 +1234,7 @@ impl Virtio9pDevice {
         let fid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let offset = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         let count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+        let msize_read_budget = self.msize.saturating_sub(REPLY_OVERHEAD);
 
         let state = match self.fids.get_mut(&fid) {
             Some(s) => s,
@@ -1101,7 +1251,13 @@ impl Virtio9pDevice {
             return Self::build_error(tag, io_error_to_errno(&e));
         }
 
-        let mut buf = vec![0u8; count as usize];
+        // `count` is whatever the guest asked for, up to 4 GiB, and it sizes
+        // this buffer. A reply may not exceed the negotiated `msize`, so
+        // anything past that budget could not be returned anyway — allocating
+        // it would only let the guest drive host memory with a single request.
+        // A guest that respects its own negotiated msize sees no change.
+        let capacity = count.min(msize_read_budget) as usize;
+        let mut buf = vec![0u8; capacity];
         let nread = match file.read(&mut buf) {
             Ok(n) => n,
             Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
@@ -1325,6 +1481,22 @@ impl Virtio9pDevice {
         let offset = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         let count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
 
+        // `count` is guest-chosen and bounds nothing on its own: the entries
+        // come from a host directory that a guest with a read-write mount fills
+        // itself. The reply also has to fit inside the negotiated `msize` —
+        // `process_queue` writes only as far as the guest's descriptors reach
+        // and then reports a short length, while the reply's own size field
+        // still declares the full one, so an oversized reply desynchronizes the
+        // 9P stream for every later request on the mount.
+        let max_bytes = count.min(self.msize.saturating_sub(REPLY_OVERHEAD)) as usize;
+        // The smallest an entry can be on the wire is a one-character name, so
+        // this many is the most the reply can possibly carry. Collecting past it
+        // would buffer a `String` and a `stat` result per entry — hundreds of
+        // megabytes on a directory the guest grew — and pay a `metadata()`
+        // syscall each, for entries that were never going to be sent.
+        const MIN_DIRENT_BYTES: usize = QID_SIZE + 8 + 1 + 2 + 1;
+        let max_entries = max_bytes / MIN_DIRENT_BYTES + 1;
+
         let state = match self.fids.get(&fid) {
             Some(s) => s,
             None => return Self::build_error(tag, libc::EBADF as u32),
@@ -1337,56 +1509,69 @@ impl Virtio9pDevice {
             Err(e) => return Self::build_error(tag, io_error_to_errno(&e)),
         };
 
-        // Collect all entries, including "." and ".."
-        let mut all_entries: Vec<(String, fs::Metadata)> = Vec::new();
+        // Entries carry their absolute position in the dirent stream, because
+        // the client pages through a directory by offset. Positions below
+        // `offset` advance the counter without being stat'd or stored, so a
+        // later page does not re-walk every earlier entry.
+        let mut collected: Vec<(u64, String, fs::Metadata)> = Vec::new();
+        let mut position = 0u64;
 
-        // Add "." entry
-        if let Ok(m) = fs::metadata(&dir_path) {
-            all_entries.push((".".to_string(), m));
-        }
-        // Add ".." entry
-        if let Some(parent) = dir_path.parent() {
-            // Ensure ".." doesn't escape root
-            let root_canon = self.root_dir.canonicalize().unwrap_or_default();
-            let parent_path = if dir_path == root_canon {
-                // At root, ".." points to root itself
-                dir_path.clone()
-            } else {
-                parent.to_path_buf()
-            };
-            if let Ok(m) = fs::metadata(&parent_path) {
-                all_entries.push(("..".to_string(), m));
+        // "." entry
+        if position >= offset && collected.len() < max_entries {
+            if let Ok(m) = fs::metadata(&dir_path) {
+                collected.push((position, ".".to_string(), m));
             }
         }
+        position += 1;
 
-        // Add regular entries
+        // ".." entry
+        if let Some(parent) = dir_path.parent() {
+            if position >= offset && collected.len() < max_entries {
+                // Ensure ".." doesn't escape root
+                let root_canon = self.root_dir.canonicalize().unwrap_or_default();
+                let parent_path = if dir_path == root_canon {
+                    // At root, ".." points to root itself
+                    dir_path.clone()
+                } else {
+                    parent.to_path_buf()
+                };
+                if let Ok(m) = fs::metadata(&parent_path) {
+                    collected.push((position, "..".to_string(), m));
+                }
+            }
+            position += 1;
+        }
+
+        // Regular entries
         for entry in entries {
+            if collected.len() >= max_entries {
+                break;
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            let at = position;
+            position += 1;
+            if at < offset {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             match entry.metadata() {
-                Ok(m) => all_entries.push((name, m)),
+                Ok(m) => collected.push((at, name, m)),
                 Err(_) => continue,
             }
         }
 
-        // Build dirent stream starting from the given offset
+        // Build dirent stream.
         // Dirent format: qid(13) + offset(8) + type(1) + name_len(2) + name(n)
         let mut dirent_data = Vec::new();
-        let max_bytes = count as usize;
 
-        for (idx, (name, metadata)) in all_entries.iter().enumerate() {
-            let entry_offset = idx as u64;
-            if entry_offset < offset {
-                continue;
-            }
-
+        for (at, name, metadata) in &collected {
             let qid = Self::build_qid(metadata);
             let dtype: u8 = if metadata.is_dir() {
                 4 // DT_DIR
-            } else if metadata.is_symlink() {
+            } else if metadata.file_type().is_symlink() {
                 10 // DT_LNK
             } else {
                 8 // DT_REG
@@ -1401,7 +1586,7 @@ impl Virtio9pDevice {
 
             dirent_data.extend_from_slice(&qid);
             // offset points to the *next* entry (so consumer can resume)
-            dirent_data.extend_from_slice(&(entry_offset + 1).to_le_bytes());
+            dirent_data.extend_from_slice(&(at + 1).to_le_bytes());
             dirent_data.push(dtype);
             dirent_data.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
             dirent_data.extend_from_slice(name_bytes);
@@ -1447,7 +1632,11 @@ impl Virtio9pDevice {
             None => return Self::build_error(tag, libc::EBADF as u32),
         };
 
-        let new_dir = parent_path.join(&name);
+        let Some(entry) = Self::entry_name(&name) else {
+            warn!("virtio-9p: Tmkdir name {name:?} is not a single entry name");
+            return Self::build_error(tag, libc::EINVAL as u32);
+        };
+        let new_dir = parent_path.join(entry);
 
         // Security check
         if let Ok(root) = self.root_dir.canonicalize() {
@@ -2106,6 +2295,370 @@ mod tests {
         assert_eq!(ecode, libc::EROFS as u32);
     }
 
+    /// `Tread`'s `count` sizes the reply buffer and comes straight from the
+    /// guest, so a single request could ask the host to allocate 4 GiB. The
+    /// negotiated `msize` bounds it.
+    #[test]
+    fn tread_count_cannot_allocate_past_the_negotiated_msize() {
+        let (mut device, dir) = make_rw_device();
+        fs::write(dir.path().join("data.txt"), b"hello").unwrap();
+
+        // Negotiate a small msize, then attach and open the file.
+        let mut version_payload = 4096u32.to_le_bytes().to_vec();
+        version_payload.extend_from_slice(&(8u16).to_le_bytes());
+        version_payload.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version_payload));
+        assert_eq!(device.msize, 4096);
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        let mut walk_payload = 0u32.to_le_bytes().to_vec();
+        walk_payload.extend_from_slice(&1u32.to_le_bytes());
+        walk_payload.extend_from_slice(&1u16.to_le_bytes());
+        walk_payload.extend_from_slice(&(8u16).to_le_bytes());
+        walk_payload.extend_from_slice(b"data.txt");
+        device.handle_9p_request(&build_request(T_WALK, 2, &walk_payload));
+
+        let mut open_payload = 1u32.to_le_bytes().to_vec();
+        open_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_LOPEN, 3, &open_payload));
+
+        // Ask for 4 GiB. The reply carries the file's 5 bytes and nothing
+        // near the requested size was ever allocated.
+        let mut read_payload = 1u32.to_le_bytes().to_vec();
+        read_payload.extend_from_slice(&0u64.to_le_bytes());
+        read_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_READ, 4, &read_payload));
+
+        assert_eq!(
+            response[4], R_READ,
+            "expected Rread, got type {}",
+            response[4]
+        );
+        let returned = u32::from_le_bytes(response[7..11].try_into().unwrap());
+        assert_eq!(returned, 5, "the whole file should come back");
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "reply of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+    }
+
+    /// A descriptor's `dlen` sizes the buffer `process_queue` reads into, and it
+    /// comes from guest-written memory. The negotiated `msize` bounds the
+    /// request, so a descriptor claiming more must not size the read.
+    ///
+    /// The fuzz corpus cannot pin this, which was measured rather than assumed:
+    /// a 4 GiB `vec![0u8; n]` is `alloc_zeroed`, so Linux maps it lazily and
+    /// never faults, and replaying the same input with the cap reverted stays
+    /// green. An allocation-size regression needs an oracle, not a crash.
+    #[test]
+    fn process_queue_caps_descriptor_reads_at_msize() {
+        let (mut device, _dir) = make_rw_device();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 64 * 1024)]).unwrap();
+
+        const DESC: u64 = 0x40;
+        const AVAIL: u64 = 0x80;
+        const USED: u64 = 0xC0;
+        // Descriptor 0: readable, claiming the whole 32-bit length space, and
+        // chained to a writable descriptor so the device has somewhere to put
+        // its reply — without one the used ring records zero bytes and the
+        // assertion below could not tell a capped read from no read at all.
+        mem.write_obj(0x200u64, GuestAddress(DESC)).unwrap();
+        mem.write_obj(u32::MAX, GuestAddress(DESC + 8)).unwrap();
+        mem.write_obj(VIRTQ_DESC_F_NEXT, GuestAddress(DESC + 12))
+            .unwrap();
+        mem.write_obj(1u16, GuestAddress(DESC + 14)).unwrap();
+        // Descriptor 1: device-writable reply buffer.
+        mem.write_obj(0x2000u64, GuestAddress(DESC + 16)).unwrap();
+        mem.write_obj(4096u32, GuestAddress(DESC + 16 + 8)).unwrap();
+        mem.write_obj(VIRTQ_DESC_F_WRITE, GuestAddress(DESC + 16 + 12))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 16 + 14)).unwrap();
+
+        mem.write_obj(0u16, GuestAddress(AVAIL)).unwrap();
+        mem.write_obj(1u16, GuestAddress(AVAIL + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+
+        program_queue(&mut device, &mem, 8, DESC, AVAIL, USED);
+        device.mmio_write(mmio::QUEUE_NOTIFY, &0u32.to_le_bytes(), Some(&mem));
+
+        // The device answers, and what it wrote back is bounded — it did not try
+        // to assemble a 4 GiB request out of one descriptor.
+        let used_len: u32 = mem.read_obj(GuestAddress(USED + 8)).unwrap();
+        assert!(
+            used_len > 0 && used_len <= MAX_MSIZE,
+            "reply length {used_len} is not a bounded reply"
+        );
+    }
+
+    /// A descriptor index at or past the queue size points outside the table the
+    /// guest allocated, so the walk must stop rather than read what follows it.
+    ///
+    /// The corpus cannot pin this either: an out-of-table read lands in zeroed
+    /// guest memory and ends the walk indistinguishably from the bound doing it.
+    #[test]
+    fn process_queue_stops_at_an_out_of_table_descriptor_index() {
+        let (mut device, _dir) = make_rw_device();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 64 * 1024)]).unwrap();
+
+        const DESC: u64 = 0x40;
+        const AVAIL: u64 = 0x80;
+        const USED: u64 = 0xC0;
+        // Descriptor 0 is a complete, valid Tversion, chained (NEXT) to index 9 —
+        // outside a 4-entry queue.
+        let mut version = 8192u32.to_le_bytes().to_vec();
+        version.extend_from_slice(&(8u16).to_le_bytes());
+        version.extend_from_slice(b"9P2000.L");
+        let request = build_request(T_VERSION, 0, &version);
+        mem.write_slice(&request, GuestAddress(0x200)).unwrap();
+
+        mem.write_obj(0x200u64, GuestAddress(DESC)).unwrap();
+        mem.write_obj(request.len() as u32, GuestAddress(DESC + 8))
+            .unwrap();
+        mem.write_obj(VIRTQ_DESC_F_NEXT, GuestAddress(DESC + 12))
+            .unwrap();
+        mem.write_obj(9u16, GuestAddress(DESC + 14)).unwrap();
+        // Descriptor 9 would append trailing bytes if the walk followed it,
+        // making the assembled request disagree with its own declared size.
+        mem.write_obj(0x300u64, GuestAddress(DESC + 9 * 16))
+            .unwrap();
+        mem.write_obj(16u32, GuestAddress(DESC + 9 * 16 + 8))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 9 * 16 + 12))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(DESC + 9 * 16 + 14))
+            .unwrap();
+
+        mem.write_obj(0u16, GuestAddress(AVAIL)).unwrap();
+        mem.write_obj(1u16, GuestAddress(AVAIL + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+
+        program_queue(&mut device, &mem, 4, DESC, AVAIL, USED);
+        device.mmio_write(mmio::QUEUE_NOTIFY, &0u32.to_le_bytes(), Some(&mem));
+
+        // Stopping at the bound leaves exactly the Tversion, which negotiates.
+        // Following the out-of-table NEXT would append 16 bytes, the declared
+        // size would no longer match, and the device would answer Rerror.
+        assert_eq!(
+            device.msize, 8192,
+            "the walk followed a descriptor index outside the table, corrupting the request"
+        );
+    }
+
+    /// `Twalk`'s `nwname` is a guest u16 and each component costs a 13-byte QID
+    /// in the reply, so an unbounded walk builds an `Rwalk` several times the
+    /// negotiated `msize` — the same desync the read and readdir caps prevent.
+    ///
+    /// A `"."` component is the cheapest: 3 payload bytes for a 13-byte QID, so
+    /// one `msize`-sized request buys a reply roughly four times `msize`.
+    #[test]
+    fn twalk_reply_cannot_exceed_the_negotiated_msize() {
+        let (mut device, _dir) = make_rw_device();
+
+        let mut version = MIN_MSIZE.to_le_bytes().to_vec();
+        version.extend_from_slice(&(8u16).to_le_bytes());
+        version.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version));
+        assert_eq!(device.msize, MIN_MSIZE);
+
+        let mut attach = 0u32.to_le_bytes().to_vec();
+        attach.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach.extend_from_slice(&0u16.to_le_bytes());
+        attach.extend_from_slice(&0u16.to_le_bytes());
+        attach.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach));
+
+        // More components than the reply budget holds QIDs for.
+        let components = (MIN_MSIZE as usize / QID_SIZE) + 32;
+        let mut walk = 0u32.to_le_bytes().to_vec();
+        walk.extend_from_slice(&1u32.to_le_bytes());
+        walk.extend_from_slice(&(components as u16).to_le_bytes());
+        for _ in 0..components {
+            walk.extend_from_slice(&(1u16).to_le_bytes());
+            walk.push(b'.');
+        }
+        let response = device.handle_9p_request(&build_request(T_WALK, 2, &walk));
+
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "Rwalk of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+
+        // A walk that fits is still served.
+        let mut short = 0u32.to_le_bytes().to_vec();
+        short.extend_from_slice(&2u32.to_le_bytes());
+        short.extend_from_slice(&1u16.to_le_bytes());
+        short.extend_from_slice(&(1u16).to_le_bytes());
+        short.push(b'.');
+        let response = device.handle_9p_request(&build_request(T_WALK, 3, &short));
+        assert_eq!(response[4], R_WALK, "a walk within budget must succeed");
+    }
+
+    /// `Tlcreate` and `Tmkdir` build their target as `parent.join(name)`, so a
+    /// name that is a path — absolute, or containing `..` — escapes the shared
+    /// directory even though the parent fid is inside it.
+    #[test]
+    fn lcreate_and_mkdir_reject_names_that_are_paths() {
+        let outside = tempfile::tempdir().expect("tempdir outside the share");
+        let (mut device, dir) = make_rw_device();
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        let escape_target = outside.path().join("escaped");
+        let absolute = escape_target.to_str().expect("utf-8 temp path").to_string();
+        for name in [absolute.as_str(), "../escaped", "..", "sub/escaped"] {
+            let mut create = 0u32.to_le_bytes().to_vec();
+            create.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            create.extend_from_slice(name.as_bytes());
+            create.extend_from_slice(&(0o102u32).to_le_bytes());
+            create.extend_from_slice(&(0o644u32).to_le_bytes());
+            create.extend_from_slice(&0u32.to_le_bytes());
+            let response = device.handle_9p_request(&build_request(T_LCREATE, 2, &create));
+            assert_eq!(response[4], R_ERROR, "Tlcreate({name:?}) should be refused");
+
+            let mut mkdir = 0u32.to_le_bytes().to_vec();
+            mkdir.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            mkdir.extend_from_slice(name.as_bytes());
+            mkdir.extend_from_slice(&(0o755u32).to_le_bytes());
+            mkdir.extend_from_slice(&0u32.to_le_bytes());
+            let response = device.handle_9p_request(&build_request(T_MKDIR, 3, &mkdir));
+            assert_eq!(response[4], R_ERROR, "Tmkdir({name:?}) should be refused");
+        }
+
+        assert!(
+            !escape_target.exists(),
+            "a guest name escaped the share to {}",
+            escape_target.display()
+        );
+        assert!(
+            !dir.path().parent().unwrap().join("escaped").exists(),
+            "a guest name escaped the share via .."
+        );
+        // A plain name still works.
+        let mut ok = 0u32.to_le_bytes().to_vec();
+        ok.extend_from_slice(&(7u16).to_le_bytes());
+        ok.extend_from_slice(b"allowed");
+        ok.extend_from_slice(&(0o755u32).to_le_bytes());
+        ok.extend_from_slice(&0u32.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_MKDIR, 4, &ok));
+        assert_eq!(response[4], R_MKDIR, "a single-component name must succeed");
+        assert!(dir.path().join("allowed").is_dir());
+    }
+
+    /// `msize` is negotiated per connection, so a reset must return it to the
+    /// ceiling, and a guest must not be able to negotiate a value so small that
+    /// the request-assembly budget starves the `Tversion` that would recover.
+    ///
+    /// A below-floor request is refused rather than raised: the reply commits the
+    /// server to a size the client agreed to receive, so answering 4096 to a
+    /// client that asked for 1024 would break the negotiation in the other
+    /// direction.
+    #[test]
+    fn msize_has_a_floor_and_is_restored_on_reset() {
+        let (mut device, _dir) = make_rw_device();
+
+        let mut tiny = 0u32.to_le_bytes().to_vec();
+        tiny.extend_from_slice(&(8u16).to_le_bytes());
+        tiny.extend_from_slice(b"9P2000.L");
+        let response = device.handle_9p_request(&build_request(T_VERSION, 0, &tiny));
+        assert_eq!(response[4], R_ERROR, "a below-floor msize must be refused");
+        assert_eq!(
+            device.msize, MAX_MSIZE,
+            "a refused negotiation must not move msize"
+        );
+
+        let mut small = 8192u32.to_le_bytes().to_vec();
+        small.extend_from_slice(&(8u16).to_le_bytes());
+        small.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &small));
+        assert_eq!(device.msize, 8192);
+
+        device.reset();
+        assert_eq!(
+            device.msize, MAX_MSIZE,
+            "reset must restore msize with the other negotiated state"
+        );
+    }
+
+    /// A request whose header disagrees with the bytes that arrived is rejected
+    /// at the entry point rather than parsed as if the header were right.
+    #[test]
+    fn request_with_mismatched_declared_size_is_rejected() {
+        let (mut device, _dir) = make_rw_device();
+        let mut request = build_request(T_VERSION, 0, &[0u8; 8]);
+        // Claim four more bytes than the buffer carries.
+        let declared = u32::from_le_bytes(request[0..4].try_into().unwrap()) + 4;
+        request[0..4].copy_from_slice(&declared.to_le_bytes());
+        let response = device.handle_9p_request(&request);
+        assert_eq!(response[4], R_ERROR);
+    }
+
+    /// `Treaddir`'s `count` bounds nothing by itself — the entries come from the
+    /// host directory — so the reply must be bounded by the negotiated `msize`,
+    /// or `process_queue` truncates it against the guest's descriptors while its
+    /// size field still declares the full length.
+    #[test]
+    fn treaddir_reply_cannot_exceed_the_negotiated_msize() {
+        let (mut device, dir) = make_rw_device();
+        // Enough entries that the dirent stream outgrows the negotiated msize.
+        // Each is ~24 bytes of dirent header plus a 24-byte name, so 600 entries
+        // is roughly 28 KB against an 8 KB budget.
+        for i in 0..600 {
+            fs::write(dir.path().join(format!("entry-{i:04}-padding-name")), b"x").unwrap();
+        }
+
+        // Above MIN_MSIZE: negotiating below the floor would clamp, and the
+        // point here is the reply bound, not the floor.
+        let mut version_payload = 8192u32.to_le_bytes().to_vec();
+        version_payload.extend_from_slice(&(8u16).to_le_bytes());
+        version_payload.extend_from_slice(b"9P2000.L");
+        device.handle_9p_request(&build_request(T_VERSION, 0, &version_payload));
+        assert_eq!(device.msize, 8192);
+
+        let mut attach_payload = 0u32.to_le_bytes().to_vec();
+        attach_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u16.to_le_bytes());
+        attach_payload.extend_from_slice(&0u32.to_le_bytes());
+        device.handle_9p_request(&build_request(T_ATTACH, 1, &attach_payload));
+
+        // Ask for 4 GiB worth of directory entries.
+        let mut readdir_payload = 0u32.to_le_bytes().to_vec();
+        readdir_payload.extend_from_slice(&0u64.to_le_bytes());
+        readdir_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let response = device.handle_9p_request(&build_request(T_READDIR, 2, &readdir_payload));
+
+        assert_eq!(response[4], R_READDIR, "expected Rreaddir");
+        assert!(
+            (response.len() as u32) <= device.msize,
+            "reply of {} bytes exceeds the negotiated msize {}",
+            response.len(),
+            device.msize
+        );
+    }
+
+    /// A request that arrives before `Tversion` is bounded by the ceiling
+    /// negotiation could never exceed, not by an unset value.
+    #[test]
+    fn msize_defaults_to_the_negotiation_ceiling() {
+        let (device, _dir) = make_rw_device();
+        assert_eq!(device.msize, MAX_MSIZE);
+    }
+
     #[test]
     fn test_build_qid_directory() {
         use std::fs;
@@ -2137,6 +2690,27 @@ mod tests {
     }
 
     /// Create an rw device rooted at a tempdir and return (device, tempdir_path).
+    /// Program a queue through the MMIO registers, the way a guest driver does.
+    fn program_queue(
+        device: &mut Virtio9pDevice,
+        mem: &GuestMemoryMmap,
+        num: u32,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) {
+        for (register, value) in [
+            (mmio::QUEUE_SEL, 0u32),
+            (mmio::QUEUE_NUM, num),
+            (mmio::QUEUE_DESC_LOW, desc as u32),
+            (mmio::QUEUE_DRIVER_LOW, avail as u32),
+            (mmio::QUEUE_DEVICE_LOW, used as u32),
+            (mmio::QUEUE_READY, 1),
+        ] {
+            device.mmio_write(register, &value.to_le_bytes(), Some(mem));
+        }
+    }
+
     fn make_rw_device() -> (Virtio9pDevice, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Virtio9pDevice::new(tmp.path(), "test", false);

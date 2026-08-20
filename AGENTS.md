@@ -862,6 +862,40 @@ ANTHROPIC_API_KEY=... cargo test --test e2e_service_mode -- --ignored --test-thr
 ANTHROPIC_API_KEY=... cargo test --test e2e_agent_mcp -- --ignored --test-threads=1
 ```
 
+### Fuzzing the guest-facing parsers
+
+Several host-side parsers read bytes a guest chooses: the control-channel frame decoder (`void-box-protocol` framing plus the multiplex request-id prefix), the userspace vsock connection state machine, the split-virtqueue reader that walks descriptor chains out of guest memory, and the 9P server together with the transport beneath it. Their harnesses live in `src/fuzz.rs`, and two callers drive the same bodies — `cargo fuzz` and the replay gate.
+
+The merge gate replays them. `tests/fuzz_corpus.rs` runs every file under `fuzz/corpus/<target>/` and `fuzz/artifacts/<target>/` through its harness on stable, as part of a plain `cargo test`. It is deterministic and costs milliseconds, so it needs no special invocation.
+
+Discovery is out of band. `cargo fuzz` needs a nightly toolchain, and a search that finds a new bug on an unrelated change would block that change, so it runs weekly and on demand in `.github/workflows/fuzz.yml` — never on a pull request (ADR-0012). To run it locally:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+# libfuzzer-sys builds the libFuzzer runtime with cc, so a C++ compiler must be
+# on PATH as `c++` (Fedora: gcc-c++; Debian/Ubuntu: g++).
+# libFuzzer writes what it discovers to the first corpus directory and reads the
+# rest without modifying them, so runs go to `fuzz/corpus-run/` (gitignored) and
+# `fuzz/corpus/` stays the curated seed set.
+mkdir -p fuzz/corpus-run/vsock_frame
+cargo +nightly fuzz run vsock_frame fuzz/corpus-run/vsock_frame fuzz/corpus/vsock_frame \
+  -- -max_total_time=60 -rss_limit_mb=2048
+# targets: vsock_frame, vsock_packet, virtqueue, nine_p, nine_p_transport
+```
+
+Do not commit what a run accumulates in `fuzz/corpus-run/`. libFuzzer keeps an input because it reached new coverage, which is not the property the replay gate checks, so those inputs would be judged against a work floor written for curated seeds. Promote one deliberately when it covers a shape worth keeping: move it into `fuzz/corpus/<target>/` and give it a name that says what it covers.
+
+`nine_p` drives the 9P message parser directly; `nine_p_transport` drives the device through its MMIO registers and guest memory, covering the queue programming and descriptor walk beneath it. The split matters: the transport parses guest data of its own — descriptor lengths size host allocations and `next` indices steer the walk — and a harness aimed at the message parser never reaches it.
+
+When a run crashes, `cargo fuzz` writes the input under `fuzz/artifacts/<target>/`. Commit that file **together with the parser fix** — the replay test then keeps the bug fixed for everyone. Never commit a crashing input ahead of its fix: it reds the gate for every unrelated change.
+
+Adding a target means adding a `[[bin]]` to `fuzz/Cargo.toml`, a harness body in `src/fuzz.rs`, an arm in `tests/fuzz_corpus.rs`, at least one seed under `fuzz/corpus/<target>/`, and a work floor in `work_floor`. `every_fuzz_target_is_replayed` fails if any of the middle three is missing, so a target cannot end up fuzzed but unguarded.
+
+A harness returns the units of work it performed — frames decoded, packets routed, chains popped, requests dispatched, registers written — and the replay test holds every seed to that target's floor. Panic-freedom alone does not show a harness still reaches its parser: one that reaches nothing returns cleanly and replays green, so the count is what makes an inert target visible. A floor only bites where the harness drives its parser from a loop over the fuzzer's bytes, because that is what a consumption bug can starve; a harness that hands the raw input straight to its parser cannot go inert that way, and takes a floor of zero. Set a floor from what the seeds actually do, with enough margin that trimming one does not trip it, and check it against the negative-space seeds — an input written to prove the parser *rejects* something does zero units of successful work by construction. The floor applies to seeds only; a crash artifact may reach its bug before doing any countable work. Assert nothing about the count inside a harness body — under `cargo fuzz` an input that does no work is an ordinary outcome, and an assertion there would be reported as a crash.
+
+A harness parameterizes itself from the raw input through a hand-rolled byte reader rather than the `arbitrary` crate. The committed corpus is tied to the exact byte-consumption order, and a crate upgrade that reorders its reads would silently repoint every seed at a different scenario.
+
 ### Test initramfs and BusyBox
 
 `scripts/build_test_image.sh` builds a minimal initramfs with `guest-agent`
