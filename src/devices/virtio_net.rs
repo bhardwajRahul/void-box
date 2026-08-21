@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace, warn};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
+use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
+use crate::devices::virtqueue::{mapped_ring, ring_addr};
 use crate::network::slirp::GUEST_MAC;
 use crate::network::NetworkBackend;
 use crate::Result;
@@ -40,6 +41,75 @@ pub mod features {
     /// Required for virtio-mmio version 2 devices
     pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 }
+
+/// Largest guest→host frame the device assembles from one descriptor chain.
+///
+/// Every descriptor carries a guest-written `len` that sizes a host allocation,
+/// so without a ceiling one chain can ask for as much memory as the guest cares
+/// to name. This bounds the allocation; whether the assembled bytes are the frame
+/// the chain described is a separate check after the walk.
+///
+/// The sum is the largest IP packet, its Ethernet framing, room for two VLAN
+/// tags, and the virtio-net header. A Linux guest offered no `VIRTIO_NET_F_MTU`
+/// sets `max_mtu` to 65535, so that is the largest frame a driver can hand over;
+/// the tags are counted so a frame at that MTU cannot land above the ceiling for
+/// carrying them.
+const MAX_TX_FRAME_BYTES: usize =
+    MAX_IP_PACKET_BYTES + ETHERNET_HEADER_BYTES + VLAN_TAG_BYTES * 2 + VirtioNetHeader::SIZE;
+
+/// Largest IP packet, from the 16-bit total-length field.
+const MAX_IP_PACKET_BYTES: usize = 65535;
+
+/// Destination, source, and EtherType.
+const ETHERNET_HEADER_BYTES: usize = 14;
+
+/// One 802.1Q tag.
+const VLAN_TAG_BYTES: usize = 4;
+
+/// Largest queue the device advertises in `QueueNumMax`, and the ceiling every
+/// queue size is held to however it is set — an MMIO write or a restored
+/// snapshot. Both descriptor walks bound their chain by the queue size, so this
+/// is what keeps that bound the one the device published.
+const QUEUE_MAX_SIZE: u16 = 256;
+
+/// Bytes in one used-ring element: the descriptor id and the length written.
+const USED_ELEM_BYTES: usize = 8;
+
+/// Bytes in one descriptor-table entry: address, length, flags, and next.
+const DESC_BYTES: usize = 16;
+
+/// Bytes a split ring spends before its entries: flags and index.
+const RING_HEADER_BYTES: usize = 4;
+
+/// Resolve the three rings of a queue, requiring each to be mapped at full size.
+///
+/// Returns their base addresses, or `None` when any of them leaves the address
+/// space or is not entirely backed by guest memory.
+fn queue_rings<M: GuestMemory + ?Sized>(
+    mem: &M,
+    desc_base: u64,
+    avail_base: u64,
+    used_base: u64,
+    queue_size: usize,
+) -> Option<(GuestAddress, GuestAddress, GuestAddress)> {
+    let desc = mapped_ring(mem, desc_base, queue_size * DESC_BYTES)?;
+    let avail = mapped_ring(mem, avail_base, RING_HEADER_BYTES + queue_size * 2)?;
+    let used = mapped_ring(
+        mem,
+        used_base,
+        RING_HEADER_BYTES + queue_size * USED_ELEM_BYTES,
+    )?;
+    Some((desc, avail, used))
+}
+
+/// Frames the device will hold for a guest that is not consuming them.
+///
+/// A frame that cannot be delivered is kept for the next call rather than
+/// dropped, because both callers clear the batch afterwards. That turns a guest
+/// which never posts RX buffers — or programs a ring the device declines — into
+/// host memory growth at the rate inbound traffic arrives, so the backlog has a
+/// ceiling and the oldest frame goes first, the way a full NIC ring behaves.
+const MAX_RX_BUFFERED_FRAMES: usize = 1024;
 
 /// Virtio network header (prepended to frames)
 #[repr(C, packed)]
@@ -228,11 +298,11 @@ impl VirtioNetDevice {
             interrupt_status: Arc::new(AtomicU32::new(0)),
             config_generation: 0,
             rx_queue: QueueState {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             tx_queue: QueueState {
-                num_max: 256,
+                num_max: QUEUE_MAX_SIZE,
                 ..Default::default()
             },
             rx_buffer: Vec::new(),
@@ -379,8 +449,12 @@ impl VirtioNetDevice {
                 self.queue_sel = value;
             }
             mmio::QUEUE_NUM => {
+                // The guest may not exceed the size the device advertises in
+                // `QueueNumMax`; the virtio spec forbids it, and both descriptor
+                // walks derive their chain bound from this value, so an unclamped
+                // write would let the guest choose its own bound.
                 let queue = self.current_queue_mut();
-                queue.num = value as u16;
+                queue.num = (value as u16).min(queue.num_max);
             }
             mmio::QUEUE_READY => {
                 let queue = self.current_queue_mut();
@@ -505,14 +579,29 @@ impl VirtioNetDevice {
         if !q.ready || q.num == 0 {
             return Ok(());
         }
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
+        // Every address below is a base the guest wrote to an MMIO register plus
+        // an offset. `vm_memory`'s `unchecked_add` is a plain `+`: it panics under
+        // `overflow-checks` and wraps otherwise, so a base near `u64::MAX` either
+        // ends the VMM process or folds the access onto unrelated mapped memory.
+        // `ring_addr` rejects the address instead, leaving the guest with a queue
+        // it programmed unusably.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
         let queue_size = q.num as usize;
+
+        // Each of the three rings is checked once, at full size, before anything
+        // is read from it. A queue whose rings are not entirely mapped is one the
+        // guest cannot operate, so the device declines the whole queue rather
+        // than discovering the gap partway through a batch — which is where a
+        // half-published used ring or an unretired descriptor comes from.
+        let Some(rings) = queue_rings(mem, desc_base, avail_base, used_base, queue_size) else {
+            warn!("virtio-net: TX queue rings are not fully mapped; declining the queue");
+            return Ok(());
+        };
+        let (desc_ring, avail_ring, used_ring) = rings;
 
         // Read available ring: flags at 0, idx at 2, ring starts at 4
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read_slice(&mut idx_buf, GuestAddress(avail_ring.0 + 2))
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
@@ -526,40 +615,114 @@ impl VirtioNetDevice {
         // path needs no realloc.
         let mut packet: Vec<u8> = Vec::with_capacity(1600);
 
+        // A queue holds at most `queue_size` buffers, so a larger gap between the
+        // guest's `avail_idx` and ours describes buffers the guest cannot have
+        // posted. Without this the 16-bit index difference alone admits 65535
+        // chains from one kick, each assembling a full frame — gigabytes of copying
+        // on the vCPU thread. Anything genuinely outstanding is picked up by the
+        // next kick.
+        let mut batched = 0usize;
+        // A malformed chain is guest-triggerable at will, so it is counted and
+        // reported once per call rather than logged per chain — a warn! per
+        // descriptor is formatting work the guest schedules on the vCPU thread.
+        let mut malformed_chains = 0usize;
+        // The counter is the only signal a field report will carry if a chain a
+        // real driver produces is ever rejected, so it keeps the first reason and
+        // the two lengths that disagreed rather than reporting a bare count.
+        let mut first_reason: Option<(&'static str, usize, usize)> = None;
+
         while self.tx_avail_idx != avail_idx {
+            if batched >= queue_size {
+                warn!("virtio-net: TX batch exceeds the {queue_size}-buffer queue; deferring the rest");
+                break;
+            }
+            batched += 1;
+
             // Ring entry: 2 bytes, at avail_addr + 4 + (tx_avail_idx % queue_size)*2
             let ring_offset = 4 + ((self.tx_avail_idx as usize) % queue_size) * 2;
+            let ring_entry_addr = GuestAddress(avail_ring.0 + ring_offset as u64);
+            let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * USED_ELEM_BYTES;
+            let used_elem_addr = GuestAddress(used_ring.0 + used_ring_off as u64);
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            mem.read_slice(&mut desc_id_buf, ring_entry_addr)
+                .map_err(|e| crate::Error::Memory(e.to_string()))?;
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
             packet.clear();
             let mut next = head_idx;
+            let mut walked = 0usize;
+            // The walk has one legitimate exit: a descriptor without NEXT. Every
+            // other way out leaves `packet` holding something the guest did not
+            // describe — a prefix, or a cycle's worth of the same buffer repeated
+            // — and a fabrication is not a frame. A real adapter drops such a
+            // packet rather than putting it on the wire.
+            let mut malformed = false;
+            let mut reason = "assembled bytes differ from the bytes described";
+            // What the chain says it carries, as opposed to what was assembled.
+            // A descriptor with `addr == 0` contributes no bytes but still
+            // describes them, so comparing assembled against described is what
+            // catches a frame the guest did not describe — the ceiling alone
+            // measures only the buffer that grew.
+            let mut described = 0usize;
             loop {
+                // An index outside the table the guest allocated. Whatever has
+                // been assembled stops short of the chain the guest described.
                 if next >= queue_size {
+                    malformed = true;
+                    reason = "next index outside the descriptor table";
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
-                let mut desc = [0u8; 16];
-                mem.read(&mut desc, desc_off)
-                    .map_err(|e| crate::Error::Memory(e.to_string()))?;
+                // A chain cannot be longer than the table it indexes into. A
+                // descriptor whose NEXT points back into the chain — at itself,
+                // or around a cycle — would otherwise spin here forever, and
+                // `packet` would grow by that descriptor's guest-written length
+                // on every pass. What it accumulated before the bound is the same
+                // buffer repeated, not a frame.
+                if walked >= queue_size {
+                    malformed = true;
+                    reason = "chain longer than the descriptor table";
+                    break;
+                }
+                walked += 1;
+
+                let desc_off = GuestAddress(desc_ring.0 + (next * DESC_BYTES) as u64);
+                let mut desc = [0u8; DESC_BYTES];
+                if mem.read_slice(&mut desc, desc_off).is_err() {
+                    malformed = true;
+                    reason = "descriptor unreadable";
+                    break;
+                }
                 let addr = u64::from_le_bytes(desc[0..8].try_into().unwrap());
                 let len = u32::from_le_bytes(desc[8..12].try_into().unwrap()) as usize;
                 let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
                 let next_desc = u16::from_le_bytes(desc[14..16].try_into().unwrap()) as usize;
-                if len > 0 && addr != 0 {
+                // `len` is guest-written and sizes the allocation below, so the
+                // ceiling bounds what one chain can ask for. A clamped read does
+                // not silently shorten the frame: it leaves the assembled bytes
+                // short of the described ones, and the check after the walk drops
+                // the chain.
+                described = described.saturating_add(len);
+                let readable = len.min(MAX_TX_FRAME_BYTES.saturating_sub(packet.len()));
+                if readable > 0 && addr != 0 {
                     // Read directly into the packet's tail instead of
                     // allocating an intermediate `Vec<u8>` and then
                     // `extend_from_slice`-ing it in.  Saves one alloc
                     // and one full memcpy per descriptor segment.
                     let off = packet.len();
-                    packet.resize(off + len, 0);
-                    mem.read(&mut packet[off..off + len], GuestAddress(addr))
-                        .map_err(|e| crate::Error::Memory(e.to_string()))?;
+                    packet.resize(off + readable, 0);
+                    // A payload the device cannot read is a chain it cannot
+                    // process, which is the malformed case: drop the frame and
+                    // retire the descriptor so the guest's ring drains. Failing
+                    // the call instead would leave the descriptor outstanding and
+                    // wedge the queue on every later kick.
+                    if mem
+                        .read_slice(&mut packet[off..off + readable], GuestAddress(addr))
+                        .is_err()
+                    {
+                        malformed = true;
+                        reason = "payload unreadable";
+                        break;
+                    }
                 }
                 if (flags & VIRTQ_DESC_F_NEXT) == 0 {
                     break;
@@ -567,19 +730,35 @@ impl VirtioNetDevice {
                 next = next_desc;
             }
 
-            if !packet.is_empty() {
-                self.process_tx_frame(&packet)?;
+            // Every byte the chain described has to be in the frame. Anything
+            // else — the ceiling clamping a read, a descriptor pointing at guest
+            // address 0, a walk that ended early — leaves a frame the guest did
+            // not describe.
+            if packet.len() != described {
+                malformed = true;
+            }
+
+            if malformed {
+                malformed_chains += 1;
+                first_reason.get_or_insert((reason, packet.len(), described));
+            } else if !packet.is_empty() {
+                // A backend refusal drops this frame; the descriptor is still
+                // retired below, because leaving it outstanding would replay the
+                // same frame on every later kick.
+                if let Err(e) = self.process_tx_frame(&packet) {
+                    warn!("virtio-net: backend refused a TX frame: {e}");
+                }
             }
 
             // Used-ring entry: 8 bytes (head_idx as u32, 0 as u32).
             // Built on the stack to avoid heap-alloc-per-frame from
             // `[...].concat()`.  TX descriptors carry no return data
-            // so the length field is always 0.
-            let used_ring_off = 4 + ((self.tx_used_idx as usize) % queue_size) * 8;
-            let mut used_elem = [0u8; 8];
+            // so the length field is always 0. A dropped frame is still
+            // completed, so the guest gets its descriptor back.
+            let mut used_elem = [0u8; USED_ELEM_BYTES];
             used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
             // bytes [4..8] stay zero (the length field).
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
+            mem.write_slice(&used_elem, used_elem_addr)
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
 
             self.tx_used_idx = self.tx_used_idx.wrapping_add(1);
@@ -591,9 +770,16 @@ impl VirtioNetDevice {
         // then bumps used.idx; the guest reads used.idx with a memory
         // barrier and iterates new entries.  Per-frame writes are
         // redundant for correctness and waste one mem.write per frame.
+        if let Some((reason, assembled, described)) = first_reason {
+            warn!(
+                "virtio-net: dropped {malformed_chains} malformed TX chain(s) this kick; \
+                 first was {reason} (assembled {assembled} of {described} bytes)"
+            );
+        }
+
         if self.tx_used_idx != initial_tx_used_idx {
             let used_idx_bytes = self.tx_used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
+            mem.write_slice(&used_idx_bytes, GuestAddress(used_ring.0 + 2))
                 .map_err(|e| crate::Error::Memory(e.to_string()))?;
         }
 
@@ -670,13 +856,23 @@ impl VirtioNetDevice {
                 q.num,
                 frames.len()
             );
-            self.rx_buffer.append(frames);
+            self.buffer_rx_frames(frames.drain(..));
             return Ok(0);
         }
-        let desc_addr = GuestAddress(q.desc_addr);
-        let avail_addr = GuestAddress(q.driver_addr);
-        let used_addr = GuestAddress(q.device_addr);
+        // See `process_tx_queue` for why the rings are checked once, at full
+        // size, before anything is read from them.
+        let (desc_base, avail_base, used_base) = (q.desc_addr, q.driver_addr, q.device_addr);
         let queue_size = q.num as usize;
+        let Some((desc_ring, avail_ring, used_ring)) =
+            queue_rings(mem, desc_base, avail_base, used_base, queue_size)
+        else {
+            warn!("virtio-net: RX queue rings are not fully mapped; declining the queue");
+            // Both callers clear the batch after this returns, so a frame not
+            // buffered here is a frame dropped. The not-ready path above buffers
+            // for the same reason.
+            self.buffer_rx_frames(frames.drain(..));
+            return Ok(0);
+        };
 
         // avail_idx is monotonically increasing; the driver bumps it
         // whenever it adds new buffers.  Read it once per try_inject_rx
@@ -685,40 +881,78 @@ impl VirtioNetDevice {
         // mid-batch the remaining frames are buffered for the next
         // call, which is the same correctness contract as before.
         let mut idx_buf = [0u8; 2];
-        mem.read(&mut idx_buf, avail_addr.unchecked_add(2u64))
+        mem.read_slice(&mut idx_buf, GuestAddress(avail_ring.0 + 2))
             .map_err(|e| crate::Error::Memory(e.to_string()))?;
         let avail_idx = u16::from_le_bytes(idx_buf);
 
         let mut frames_injected: u16 = 0;
+        // Drained explicitly rather than with a `for` over `drain(..)`: an abort
+        // has to hand the current frame and the untouched remainder back to
+        // `rx_buffer`, and dropping a `Drain` discards whatever it has not
+        // yielded.
+        let mut batch = frames.drain(..);
+        let mut aborted = false;
+        // A guest-memory access can fail for an address that is a perfectly
+        // ordinary `u64` and simply unmapped, which `ring_addr` cannot see. That
+        // is the reachable failure, so it aborts the batch the same way — frame
+        // handed back, completions published — and the error surfaces after.
+        let mut failure: Option<crate::Error> = None;
+        // Counted and reported once per call: a guest can post an unusable chain
+        // for every buffer in its ring.
+        let mut undeliverable_frames = 0usize;
 
-        for frame in frames.drain(..) {
+        for frame in batch.by_ref() {
             if self.rx_avail_idx == avail_idx {
-                self.rx_buffer.push(frame);
+                self.buffer_rx_frame(frame);
                 continue;
             }
 
-            let ring_offset = 4 + ((self.rx_avail_idx as usize) % queue_size) * 2;
+            let ring_offset = RING_HEADER_BYTES + ((self.rx_avail_idx as usize) % queue_size) * 2;
+            let ring_entry_addr = GuestAddress(avail_ring.0 + ring_offset as u64);
             let mut desc_id_buf = [0u8; 2];
-            mem.read(
-                &mut desc_id_buf,
-                avail_addr.unchecked_add(ring_offset as u64),
-            )
-            .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            if let Err(e) = mem.read_slice(&mut desc_id_buf, ring_entry_addr) {
+                failure = Some(crate::Error::Memory(e.to_string()));
+                self.buffer_rx_frame(frame);
+                aborted = true;
+                break;
+            }
             let head_idx = u16::from_le_bytes(desc_id_buf) as usize;
 
+            let used_ring_off =
+                RING_HEADER_BYTES + ((self.rx_used_idx as usize) % queue_size) * USED_ELEM_BYTES;
+            let used_elem_addr = GuestAddress(used_ring.0 + used_ring_off as u64);
+
             let mut next = head_idx;
+            let mut walked = 0usize;
             let mut written = 0;
             let frame_len = frame.len();
             let mut frame_off = 0;
+            // Set when the descriptor chain the guest posted cannot take this
+            // frame. The frame is dropped rather than handed back: the chain is
+            // the guest's, so retrying the same frame against the same chain
+            // fails identically on every later call, and the backlog only grows.
+            let mut undeliverable = false;
 
             loop {
                 if next >= queue_size || frame_off >= frame_len {
                     break;
                 }
-                let desc_off = desc_addr.unchecked_add((next * 16) as u64);
-                let mut desc = [0u8; 16];
-                mem.read(&mut desc, desc_off)
-                    .map_err(|e| crate::Error::Memory(e.to_string()))?;
+                // Consuming the frame ends a well-formed chain, but a descriptor
+                // with `len == 0` or `addr == 0` advances `frame_off` by nothing,
+                // so a cycle among those never reaches that condition. The table
+                // size bounds the walk regardless of what the chain describes.
+                if walked >= queue_size {
+                    warn!("virtio-net: RX chain longer than the {queue_size}-entry table (cycle?)");
+                    break;
+                }
+                walked += 1;
+
+                let desc_off = GuestAddress(desc_ring.0 + (next * DESC_BYTES) as u64);
+                let mut desc = [0u8; DESC_BYTES];
+                if mem.read_slice(&mut desc, desc_off).is_err() {
+                    undeliverable = true;
+                    break;
+                }
                 let addr = u64::from_le_bytes(desc[0..8].try_into().unwrap());
                 let len = u32::from_le_bytes(desc[8..12].try_into().unwrap()) as usize;
                 let flags = u16::from_le_bytes(desc[12..14].try_into().unwrap());
@@ -726,8 +960,14 @@ impl VirtioNetDevice {
 
                 if len > 0 && addr != 0 {
                     let to_write = (len).min(frame_len - frame_off);
-                    mem.write(&frame[frame_off..frame_off + to_write], GuestAddress(addr))
-                        .map_err(|e| crate::Error::Memory(e.to_string()))?;
+                    let dest = GuestAddress(addr);
+                    if mem
+                        .write_slice(&frame[frame_off..frame_off + to_write], dest)
+                        .is_err()
+                    {
+                        undeliverable = true;
+                        break;
+                    }
                     written += to_write;
                     frame_off += to_write;
                 }
@@ -738,20 +978,38 @@ impl VirtioNetDevice {
                 next = next_desc;
             }
 
+            if undeliverable {
+                // The descriptor is retired with what was written, so the guest's
+                // ring drains and the next frame gets a fresh chain.
+                undeliverable_frames += 1;
+            }
+
             // Used-ring entry is exactly 8 bytes (2x u32, little-endian).
             // Build it on the stack instead of allocating a Vec via
             // `[...].concat()` — the previous code did a heap alloc per
             // frame in the hot path.
-            let used_ring_off = 4 + ((self.rx_used_idx as usize) % queue_size) * 8;
-            let mut used_elem = [0u8; 8];
+            let mut used_elem = [0u8; USED_ELEM_BYTES];
             used_elem[0..4].copy_from_slice(&(head_idx as u32).to_le_bytes());
             used_elem[4..8].copy_from_slice(&(written as u32).to_le_bytes());
-            mem.write(&used_elem, used_addr.unchecked_add(used_ring_off as u64))
-                .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            if let Err(e) = mem.write_slice(&used_elem, used_elem_addr) {
+                failure = Some(crate::Error::Memory(e.to_string()));
+                self.buffer_rx_frame(frame);
+                aborted = true;
+                break;
+            }
 
             self.rx_used_idx = self.rx_used_idx.wrapping_add(1);
             self.rx_avail_idx = self.rx_avail_idx.wrapping_add(1);
             frames_injected = frames_injected.wrapping_add(1);
+        }
+
+        if aborted {
+            self.buffer_rx_frames(batch.by_ref());
+        }
+        drop(batch);
+
+        if undeliverable_frames > 0 {
+            warn!("virtio-net: dropped {undeliverable_frames} RX frame(s) the guest's chains could not take");
         }
 
         // Publish the new used.idx ONCE at the end of the batch.  The
@@ -761,15 +1019,42 @@ impl VirtioNetDevice {
         // entries.  Per-frame writes are redundant — saves one
         // mem.write per frame on the hot path.
         if frames_injected > 0 {
-            let used_idx_bytes = self.rx_used_idx.to_le_bytes();
-            mem.write(&used_idx_bytes, used_addr.unchecked_add(2u64))
-                .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            if let Some(used_idx_addr) = ring_addr(used_base, 2) {
+                let used_idx_bytes = self.rx_used_idx.to_le_bytes();
+                mem.write_slice(&used_idx_bytes, used_idx_addr)
+                    .map_err(|e| crate::Error::Memory(e.to_string()))?;
+            } else {
+                warn!("virtio-net: RX used ring at {used_base:#x} overflows the address space");
+            }
         }
 
         if frames_injected > 0 {
             self.interrupt_status.fetch_or(1, Ordering::Relaxed);
         }
+
+        // Surfaced only after the completions are published and the batch is
+        // back in `rx_buffer`: the frames already delivered are the guest's
+        // regardless of what went wrong on the one that failed.
+        if let Some(e) = failure {
+            return Err(e);
+        }
         Ok(frames_injected as usize)
+    }
+
+    /// Hold a frame for a later call, dropping the oldest once the backlog is
+    /// full.
+    fn buffer_rx_frame(&mut self, frame: Vec<u8>) {
+        if self.rx_buffer.len() >= MAX_RX_BUFFERED_FRAMES {
+            self.rx_buffer.remove(0);
+        }
+        self.rx_buffer.push(frame);
+    }
+
+    /// Hold a batch of frames for a later call, under the same ceiling.
+    fn buffer_rx_frames(&mut self, frames: impl IntoIterator<Item = Vec<u8>>) {
+        for frame in frames {
+            self.buffer_rx_frame(frame);
+        }
     }
 
     /// Reset device to initial state
@@ -783,11 +1068,11 @@ impl VirtioNetDevice {
         self.rx_avail_idx = 0;
         self.rx_used_idx = 0;
         self.rx_queue = QueueState {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.tx_queue = QueueState {
-            num_max: 256,
+            num_max: QUEUE_MAX_SIZE,
             ..Default::default()
         };
         self.rx_buffer.clear();
@@ -840,7 +1125,7 @@ impl VirtioNetDevice {
         let mut packet = Vec::with_capacity(VirtioNetHeader::SIZE + frame.len());
         packet.extend_from_slice(&VirtioNetHeader::new().to_bytes());
         packet.extend_from_slice(&frame);
-        self.rx_buffer.push(packet);
+        self.buffer_rx_frame(packet);
 
         // Set interrupt
         self.interrupt_status.fetch_or(1, Ordering::Relaxed);
@@ -899,8 +1184,11 @@ impl VirtioNetDevice {
 
         if let Some(q) = state.queues.first() {
             self.rx_queue = QueueState {
-                num_max: q.num_max,
-                num: q.num,
+                // A snapshot is a file, so its queue geometry is not the device's
+                // own. Both fields are held to the advertised ceiling here, the
+                // same one an MMIO write is held to.
+                num_max: q.num_max.min(QUEUE_MAX_SIZE),
+                num: q.num.min(q.num_max).min(QUEUE_MAX_SIZE),
                 ready: q.ready,
                 desc_addr: q.desc_addr,
                 driver_addr: q.driver_addr,
@@ -911,8 +1199,8 @@ impl VirtioNetDevice {
         }
         if let Some(q) = state.queues.get(1) {
             self.tx_queue = QueueState {
-                num_max: q.num_max,
-                num: q.num,
+                num_max: q.num_max.min(QUEUE_MAX_SIZE),
+                num: q.num.min(q.num_max).min(QUEUE_MAX_SIZE),
                 ready: q.ready,
                 desc_addr: q.desc_addr,
                 driver_addr: q.driver_addr,
@@ -971,6 +1259,480 @@ impl VirtioNetDevice {
 mod tests {
     use super::*;
     use crate::network::slirp::SlirpBackend;
+    use vm_memory::GuestMemoryMmap;
+
+    const TEST_MEM_BYTES: usize = 256 * 1024;
+    const DESC_TABLE: u64 = 0x1000;
+    const AVAIL_RING: u64 = 0x4000;
+    const USED_RING: u64 = 0x5000;
+    const DATA_BUFFER: u64 = 0x8000;
+
+    fn test_device() -> VirtioNetDevice {
+        let slirp: Arc<Mutex<dyn NetworkBackend>> =
+            Arc::new(Mutex::new(SlirpBackend::new().unwrap()));
+        VirtioNetDevice::new(slirp).unwrap()
+    }
+
+    /// Records what the device transmits, so a test can assert on the frame
+    /// itself rather than on the completion that follows it.
+    struct RecordingBackend {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl NetworkBackend for RecordingBackend {
+        fn process_guest_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+            self.sent.lock().unwrap().push(frame.to_vec());
+            Ok(())
+        }
+
+        fn drain_to_guest(&mut self, _out: &mut Vec<Vec<u8>>) {}
+    }
+
+    /// A device whose transmitted frames are captured in the returned handle.
+    fn recording_device() -> (VirtioNetDevice, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend { sent: sent.clone() };
+        let backend: Arc<Mutex<dyn NetworkBackend>> = Arc::new(Mutex::new(backend));
+        (VirtioNetDevice::new(backend).unwrap(), sent)
+    }
+
+    fn test_memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_MEM_BYTES)]).unwrap()
+    }
+
+    /// Write one 16-byte descriptor into the table at `index`.
+    fn write_desc(mem: &GuestMemoryMmap, index: u64, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = GuestAddress(DESC_TABLE + index * 16);
+        mem.write_obj(addr, at).unwrap();
+        mem.write_obj(len, GuestAddress(at.0 + 8)).unwrap();
+        mem.write_obj(flags, GuestAddress(at.0 + 12)).unwrap();
+        mem.write_obj(next, GuestAddress(at.0 + 14)).unwrap();
+    }
+
+    /// Publish one chain head on the available ring.
+    fn publish_head(mem: &GuestMemoryMmap, head: u16) {
+        mem.write_obj(1u16, GuestAddress(AVAIL_RING + 2)).unwrap();
+        mem.write_obj(head, GuestAddress(AVAIL_RING + 4)).unwrap();
+    }
+
+    fn program_queue(queue: &mut QueueState, num: u16) {
+        queue.num = num;
+        queue.ready = true;
+        queue.desc_addr = DESC_TABLE;
+        queue.driver_addr = AVAIL_RING;
+        queue.device_addr = USED_RING;
+    }
+
+    /// A descriptor whose NEXT points back at itself used to spin forever while
+    /// the frame buffer grew by that descriptor's guest-written length on every
+    /// pass. A regression in the bound does not fail — it hangs until the
+    /// harness timeout; the assertion on what was sent is what fails if the
+    /// cycle is bounded but its output still goes out.
+    #[test]
+    fn tx_self_referential_chain_terminates_without_transmitting() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, DATA_BUFFER, 0x1000, VIRTQ_DESC_F_NEXT, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert_eq!(
+            device.tx_used_idx, 1,
+            "the chain is completed rather than walked forever"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a cycle's worth of one buffer repeated is not a frame the guest described"
+        );
+    }
+
+    /// A cycle short enough to stay under the frame ceiling is the case the
+    /// ceiling cannot catch: every read is a full `len`, so a size-based check
+    /// never fires while the walk still assembles one buffer repeated
+    /// `queue_size` times.
+    #[test]
+    fn a_bounded_cycle_under_the_frame_ceiling_is_still_not_a_frame() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        // 256 x 256 bytes = 65536, just under MAX_TX_FRAME_BYTES.
+        let queue_size = 256u16;
+        write_desc(&mem, 0, DATA_BUFFER, 256, VIRTQ_DESC_F_NEXT, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, queue_size);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the assembled bytes stay under the ceiling, so only the walk's exit can reject them"
+        );
+        assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// A NEXT pointing outside the descriptor table ends the walk early. What
+    /// was assembled is a prefix of the chain the guest described, not the frame.
+    #[test]
+    fn a_dangling_next_is_not_transmitted_as_a_short_frame() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, DATA_BUFFER, 128, VIRTQ_DESC_F_NEXT, 9999);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a chain that cannot be walked to its end is not a frame"
+        );
+        assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// A used-ring address can be an ordinary `u64` and simply unmapped, which
+    /// checked arithmetic cannot see. Transmitting first and discovering the
+    /// completion is unwritable afterwards leaves the descriptor unretired, so
+    /// every later kick resends the same frame.
+    #[test]
+    fn a_frame_is_not_transmitted_when_its_completion_is_unwritable() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        let payload_len = 512u32;
+        write_desc(&mem, 0, DATA_BUFFER, payload_len, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+        // Well past the mapped region, but nowhere near overflowing.
+        device.tx_queue.device_addr = (TEST_MEM_BYTES as u64) * 4;
+
+        device
+            .process_tx_queue(&mem)
+            .expect("the batch is deferred");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing goes out when the completion cannot be written"
+        );
+        assert_eq!(device.tx_used_idx, 0, "no completion is claimed");
+        assert_eq!(device.tx_avail_idx, 0, "the entry stays for a later kick");
+    }
+
+    /// A descriptor pointing at guest address 0 describes bytes and contributes
+    /// none, so a size ceiling measured on the assembled buffer never sees the
+    /// chain grow. What the guest described and what the device assembled have to
+    /// agree.
+    #[test]
+    fn a_chain_describing_bytes_it_does_not_supply_is_not_a_frame() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, 0, 4096, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(&mem, 1, DATA_BUFFER, 4096, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "half of a chain is not the frame the guest described"
+        );
+        assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// The ceiling bounds the allocation inside the walk, which the
+    /// described-vs-assembled check cannot: that check runs after the buffer has
+    /// already grown. Pinning it needs a chain whose descriptors are backed by
+    /// real memory, so that removing the ceiling lets the reads succeed and the
+    /// oversized frame go out — against a small region the reads fail instead and
+    /// the chain is rejected for the wrong reason.
+    #[test]
+    fn a_chain_over_the_ceiling_is_dropped_even_when_its_memory_is_backed() {
+        let (mut device, sent) = recording_device();
+        // Room for two full-ceiling segments plus the rings.
+        let mem_bytes = MAX_TX_FRAME_BYTES * 2 + 0x2_0000;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_bytes)]).unwrap();
+
+        let segment = MAX_TX_FRAME_BYTES;
+        let first = 0x1_0000u64;
+        let second = first + segment as u64;
+        write_desc(&mem, 0, first, segment as u32, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(&mem, 1, second, segment as u32, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a chain describing twice the ceiling must not be assembled and sent"
+        );
+        assert_eq!(device.tx_used_idx, 1, "the descriptor is still returned");
+    }
+
+    /// The shape a Linux driver emits whenever it cannot push the header into
+    /// the first buffer: a header descriptor chained to a payload descriptor.
+    /// Every other multi-descriptor test here is a chain that must be rejected,
+    /// so without this nothing shows that a legitimate chained frame is accepted
+    /// — which is what the described-vs-assembled check would break first if it
+    /// were too strict.
+    #[test]
+    fn a_conforming_chained_tx_frame_is_transmitted_whole() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        let header = vec![0u8; VirtioNetHeader::SIZE];
+        let payload: Vec<u8> = (0..1514u32).map(|i| (i % 251) as u8).collect();
+        mem.write_slice(&header, GuestAddress(DATA_BUFFER)).unwrap();
+        mem.write_slice(&payload, GuestAddress(DATA_BUFFER + 0x1000))
+            .unwrap();
+
+        write_desc(
+            &mem,
+            0,
+            DATA_BUFFER,
+            header.len() as u32,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&mem, 1, DATA_BUFFER + 0x1000, payload.len() as u32, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "a chained frame is transmitted, not dropped");
+        assert_eq!(sent[0], payload, "and it arrives whole");
+    }
+
+    /// The address the ring check exists for: an ordinary `u64`, simply not
+    /// backed by guest memory. Checked arithmetic accepts it, so only a mapping
+    /// check declines the queue.
+    #[test]
+    fn rx_frames_survive_a_ring_that_is_unmapped_rather_than_overflowing() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        program_queue(&mut device.rx_queue, 4);
+        device.rx_queue.device_addr = (TEST_MEM_BYTES as u64) * 4;
+        publish_head(&mem, 0);
+        write_desc(&mem, 0, DATA_BUFFER, 2048, 0, 0);
+
+        let original = vec![vec![0xAAu8; 64], vec![0xBBu8; 32]];
+        let mut batch = original.clone();
+        let injected = device
+            .write_frames_to_rx_ring(&mut batch, &mem)
+            .expect("the ring is declined");
+
+        assert_eq!(injected, 0);
+        assert_eq!(device.rx_buffer, original, "every frame is kept, in order");
+    }
+
+    /// The backlog a guest can force the device to hold has a ceiling: frames it
+    /// cannot deliver are kept rather than dropped, so without one an idle RX
+    /// ring turns inbound traffic into unbounded host memory.
+    #[test]
+    fn the_rx_backlog_has_a_ceiling_and_sheds_the_oldest() {
+        let mut device = test_device();
+        let mem = test_memory();
+        // Not ready, so every frame takes the buffering path the device uses when
+        // it cannot deliver — driving the call sites rather than the helper.
+        device.rx_queue.ready = false;
+
+        let overflow = 64usize;
+        for i in 0..(MAX_RX_BUFFERED_FRAMES + overflow) {
+            let mut batch = vec![vec![(i % 251) as u8; 8]];
+            device
+                .write_frames_to_rx_ring(&mut batch, &mem)
+                .expect("frames are buffered");
+        }
+
+        assert_eq!(device.rx_buffer.len(), MAX_RX_BUFFERED_FRAMES);
+        assert_eq!(
+            device.rx_buffer[0],
+            vec![(overflow % 251) as u8; 8],
+            "the oldest frame is the one shed, as a full adapter ring does"
+        );
+    }
+
+    /// The RX walk ends when the frame is consumed, so a cycle only runs forever
+    /// through descriptors that consume nothing: `len == 0` here.
+    #[test]
+    fn rx_zero_length_cycle_terminates() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        write_desc(&mem, 0, DATA_BUFFER, 0, VIRTQ_DESC_F_NEXT, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.rx_queue, 4);
+
+        let injected = device
+            .write_frames_to_rx_ring(&mut vec![vec![0xAAu8; 64]], &mem)
+            .expect("RX walk returns");
+
+        assert_eq!(injected, 1, "the frame is completed rather than retried");
+    }
+
+    /// Every descriptor length is a guest-written `u32` and the chain sizes a
+    /// host allocation, so a chain describing more than one frame must not be
+    /// assembled — and the prefix that was assembled must not go out as if it
+    /// were the frame.
+    #[test]
+    fn an_oversized_tx_chain_is_dropped_rather_than_truncated() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        // Four descriptors, each claiming the whole 4 GiB a u32 can express.
+        for index in 0..4u64 {
+            let last = index == 3;
+            write_desc(
+                &mem,
+                index,
+                DATA_BUFFER,
+                u32::MAX,
+                if last { 0 } else { VIRTQ_DESC_F_NEXT },
+                (index + 1) as u16,
+            );
+        }
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "an over-ceiling chain must not put a truncated frame on the wire"
+        );
+        assert_eq!(
+            device.tx_used_idx, 1,
+            "the descriptor is still returned to the guest"
+        );
+    }
+
+    /// A frame within the ceiling is transmitted whole — the cap must not cost
+    /// the ordinary path anything.
+    #[test]
+    fn a_conforming_tx_frame_is_transmitted_intact() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        let payload_len = 1514u32;
+        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+        mem.write_slice(&payload, GuestAddress(DATA_BUFFER))
+            .unwrap();
+
+        write_desc(&mem, 0, DATA_BUFFER, payload_len, 0, 0);
+        publish_head(&mem, 0);
+        program_queue(&mut device.tx_queue, 4);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the frame is transmitted");
+        // `process_tx_frame` strips the virtio-net header before handing the
+        // frame to the backend.
+        assert_eq!(sent[0].len(), payload_len as usize - VirtioNetHeader::SIZE);
+        assert_eq!(sent[0][..], payload[VirtioNetHeader::SIZE..]);
+    }
+
+    /// One kick must not be able to name more buffers than the queue can hold:
+    /// the 16-bit index difference alone admits 65535 chains, each assembling a
+    /// full frame.
+    #[test]
+    fn one_kick_processes_at_most_a_queues_worth_of_chains() {
+        let (mut device, sent) = recording_device();
+        let mem = test_memory();
+
+        let queue_size = 4u16;
+        write_desc(&mem, 0, DATA_BUFFER, 64, 0, 0);
+        for slot in 0..queue_size {
+            mem.write_obj(0u16, GuestAddress(AVAIL_RING + 4 + u64::from(slot) * 2))
+                .unwrap();
+        }
+        // The guest claims far more outstanding buffers than the queue holds.
+        mem.write_obj(u16::MAX, GuestAddress(AVAIL_RING + 2))
+            .unwrap();
+        program_queue(&mut device.tx_queue, queue_size);
+
+        device.process_tx_queue(&mem).expect("TX walk returns");
+
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            queue_size as usize,
+            "the batch is bounded by the queue size, not by the guest's index"
+        );
+    }
+
+    /// Ring addresses come from unvalidated MMIO writes, so a base near the top
+    /// of the address space is reachable and the offset arithmetic must reject it
+    /// rather than overflow.
+    #[test]
+    fn ring_addresses_near_the_top_of_memory_do_not_overflow() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        for queue in [&mut device.tx_queue, &mut device.rx_queue] {
+            queue.num = 256;
+            queue.ready = true;
+            queue.desc_addr = u64::MAX;
+            queue.driver_addr = u64::MAX;
+            queue.device_addr = u64::MAX;
+        }
+
+        device
+            .process_tx_queue(&mem)
+            .expect("TX declines the queue");
+        let injected = device
+            .write_frames_to_rx_ring(&mut vec![vec![0xAAu8; 64]], &mem)
+            .expect("RX declines the queue");
+        assert_eq!(injected, 0);
+    }
+
+    /// A ring the guest programmed unusably costs it the batch, but the frames
+    /// are handed back rather than dropped: both callers clear their batch after
+    /// the call, so a frame this function does not keep is a frame gone.
+    #[test]
+    fn rx_frames_survive_an_unusable_ring() {
+        let mut device = test_device();
+        let mem = test_memory();
+
+        program_queue(&mut device.rx_queue, 4);
+        device.rx_queue.device_addr = u64::MAX;
+        publish_head(&mem, 0);
+        write_desc(&mem, 0, DATA_BUFFER, 2048, 0, 0);
+
+        let original = vec![vec![0xAAu8; 64], vec![0xBBu8; 32], vec![0xCCu8; 16]];
+        let mut batch = original.clone();
+        let injected = device
+            .write_frames_to_rx_ring(&mut batch, &mem)
+            .expect("the ring is declined");
+
+        assert_eq!(injected, 0, "nothing is completed against an unusable ring");
+        // Compared by content and in order: a count alone passes an
+        // implementation that drops one frame and buffers another twice.
+        assert_eq!(
+            device.rx_buffer, original,
+            "every frame is kept once, in the order it arrived"
+        );
+    }
+
+    /// `QueueNum` is an MMIO register the guest writes with no validation, and
+    /// both descriptor walks derive their chain bound from it.
+    #[test]
+    fn queue_num_is_clamped_to_the_advertised_maximum() {
+        let mut device = test_device();
+
+        let no_mem: Option<&GuestMemoryMmap> = None;
+        device.mmio_write(mmio::QUEUE_SEL, &0u32.to_le_bytes(), no_mem);
+        device.mmio_write(mmio::QUEUE_NUM, &u32::MAX.to_le_bytes(), no_mem);
+
+        assert_eq!(device.rx_queue.num, device.rx_queue.num_max);
+    }
 
     #[test]
     fn test_virtio_net_header() {
